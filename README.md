@@ -51,6 +51,29 @@ restyling (claymation, full scene restyle) runs at single-digit FPS alongside a
 face swap on a mid-range card, so it's deliberately absent rather than shipped
 broken.
 
+## ⚠️ Model licensing — read before charging customers
+
+`inswapper_128` is an InsightFace research model. **The authors restrict it to
+non-commercial use**, and pulled it from official distribution — which is why
+it now only exists on community mirrors and why those mirrors keep breaking.
+
+Every open face-swap project (roop, facefusion, and their forks) uses this same
+model and inherits the same restriction. Running it inside a paid subscription
+product is a real legal exposure, not a technicality.
+
+Options, honestly:
+
+1. **Contact InsightFace for a commercial licence.** The correct route, and
+   worth doing before you take payments.
+2. **Use a commercially-licensed face-swap API** and swap out the engine —
+   `face_swap.py` is isolated behind a small interface for exactly this reason.
+   Higher per-minute cost, clean licensing.
+3. **Launch the other modules first.** Images, video, voice and campaigns all
+   run on properly licensed commercial APIs. Face swap can follow once the
+   licence question is settled.
+
+Nothing else in this stack has this problem — it's specific to the swap model.
+
 ## Models
 
 - **buffalo_l** (InsightFace) — detection, landmarks, recognition embeddings.

@@ -37,10 +37,18 @@ except Exception:  # pragma: no cover - import guarded for CPU/dev boxes
     FaceAnalysis = None
 
 
-INSWAPPER_URL = (
-    "https://github.com/facefusion/facefusion-assets/releases/"
-    "download/models/inswapper_128.onnx"
-)
+# Community mirrors, tried in order. These move and disappear regularly, so
+# the download is best-effort — if every mirror fails the worker tells you to
+# place the file yourself rather than dying with a stack trace.
+INSWAPPER_MIRRORS = [
+    "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx",
+    "https://huggingface.co/countfloyd/deepfake/resolve/main/inswapper_128.onnx",
+    "https://huggingface.co/datasets/OwlMaster/gg1342/resolve/main/inswapper_128.onnx",
+    "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/inswapper_128.onnx",
+]
+
+# Rough size sanity check — a 404 HTML page is a few KB, the model is ~530MB.
+MIN_MODEL_BYTES = 100 * 1024 * 1024
 
 
 @dataclass
@@ -73,9 +81,8 @@ class FaceSwapEngine:
 
         # The swap model itself.
         swap_path = os.path.join(model_dir, "inswapper_128.onnx")
-        if not os.path.exists(swap_path):
-            logger.info("Downloading inswapper_128.onnx …")
-            self._download(INSWAPPER_URL, swap_path)
+        if not os.path.exists(swap_path) or os.path.getsize(swap_path) < MIN_MODEL_BYTES:
+            self._fetch_swapper(swap_path)
         self.swapper = insightface.model_zoo.get_model(
             swap_path,
             providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
@@ -112,11 +119,42 @@ class FaceSwapEngine:
         except Exception:
             return "unknown"
 
+    def _fetch_swapper(self, dest: str) -> None:
+        """Try each mirror until one yields a plausibly-sized model."""
+        for url in INSWAPPER_MIRRORS:
+            try:
+                logger.info("Fetching inswapper_128.onnx from %s", url.split("/")[2])
+                self._download(url, dest)
+                size = os.path.getsize(dest)
+                if size < MIN_MODEL_BYTES:
+                    logger.warning("Got %d bytes — not the model, trying next", size)
+                    os.remove(dest)
+                    continue
+                logger.info("Downloaded inswapper_128.onnx (%d MB)", size // 1048576)
+                return
+            except Exception as e:
+                logger.warning("Mirror failed (%s)", e)
+                if os.path.exists(dest):
+                    os.remove(dest)
+
+        raise RuntimeError(
+            "\n" + "=" * 62
+            + "\n Could not download inswapper_128.onnx from any mirror."
+            + "\n"
+            + "\n Put the file at:  " + dest
+            + "\n"
+            + "\n On Runpod, open a shell on the pod and run:"
+            + "\n   wget -O " + dest + " <url-to-inswapper_128.onnx>"
+            + "\n"
+            + "\n Because /models is a volume, you only need to do this once."
+            + "\n" + "=" * 62
+        )
+
     @staticmethod
     def _download(url: str, dest: str) -> None:
         import httpx
 
-        with httpx.stream("GET", url, follow_redirects=True, timeout=120) as r:
+        with httpx.stream("GET", url, follow_redirects=True, timeout=300) as r:
             r.raise_for_status()
             with open(dest, "wb") as f:
                 for chunk in r.iter_bytes():
