@@ -1,0 +1,61 @@
+name: Build & push worker image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.py"
+      - requirements.txt
+      - Dockerfile
+      - .github/workflows/build.yml
+  workflow_dispatch: {} # lets you trigger it by hand from the Actions tab
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # needed to push to GHCR
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # CUDA images are large and GitHub runners ship with ~14GB free.
+      # Clearing the preinstalled toolchains buys back ~20GB.
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64 # Runpod GPUs are all amd64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ github.sha }}
+          # Layer cache across runs: pip install won't re-run unless
+          # requirements.txt actually changes.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image URL
+        run: |
+          echo "Pull this in Runpod:"
+          echo "${{ env.REGISTRY }}/${{ env.IMAGE }}:latest"

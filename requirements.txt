@@ -1,0 +1,20 @@
+# LiveKit real-time agent runtime
+livekit-agents>=0.11
+livekit>=0.17
+livekit-api>=0.7
+
+# Real-time face swap
+insightface>=0.7.3          # inswapper_128 + buffalo_l face analysis
+onnxruntime-gpu>=1.17       # swap to plain `onnxruntime` on CPU-only boxes
+opencv-python-headless>=4.9
+
+# insightface and onnxruntime are built against the numpy 1.x ABI; numpy 2
+# causes import-time crashes that look like model-loading failures.
+numpy<2
+Pillow>=10.2
+
+# Dispatch API + config
+fastapi>=0.110
+uvicorn[standard]>=0.29
+httpx>=0.27
+python-dotenv>=1.0
