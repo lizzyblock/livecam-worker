@@ -5,7 +5,13 @@ livekit-api>=0.7
 
 # Real-time face swap
 insightface>=0.7.3          # inswapper_128 + buffalo_l face analysis
-onnxruntime-gpu>=1.17       # swap to plain `onnxruntime` on CPU-only boxes
+
+# PINNED DELIBERATELY. onnxruntime-gpu 1.19+ requires cuDNN 9, but the CUDA
+# base image ships cuDNN 8. A mismatch doesn't error — it silently falls back
+# to CPUExecutionProvider and runs at ~2fps. 1.18.1 is the last release that
+# pairs with CUDA 12.x + cuDNN 8.
+onnxruntime-gpu==1.18.1
+
 opencv-python-headless>=4.9
 
 # insightface and onnxruntime are built against the numpy 1.x ABI; numpy 2

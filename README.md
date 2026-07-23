@@ -79,7 +79,16 @@ First build: **10–25 minutes.** Most of it is the ~2.5GB CUDA base plus the
 the layers cached — and because `requirements.txt` is copied before the source,
 changing your Python code doesn't re-run pip at all.
 
-Two things that trip up this image specifically:
+Three things that trip up this image specifically:
+
+- **onnxruntime silently falls back to CPU.** This is the nastiest one,
+  because nothing errors — the models load, the worker reports healthy, and
+  face swap runs at ~2fps. Two separate causes, both handled in the
+  Dockerfile: insightface depends on the CPU-only `onnxruntime` package which
+  shadows `onnxruntime-gpu`, and onnxruntime-gpu 1.19+ needs cuDNN 9 while the
+  CUDA base image ships cuDNN 8. The build now asserts that
+  `CUDAExecutionProvider` is present and fails loudly if it isn't.
+  **Always check `"gpu": true` on `/healthz`, not just `"engine": true`.**
 
 - **insightface compiles from source.** It needs `build-essential` and
   `python3-dev`, and its `setup.py` imports numpy and Cython at build time —

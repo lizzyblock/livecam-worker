@@ -80,7 +80,37 @@ class FaceSwapEngine:
             swap_path,
             providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
         )
-        logger.info("Face swap engine ready (models in %s)", model_dir)
+
+        self.provider = self._active_provider()
+        if self.provider == "CUDAExecutionProvider":
+            logger.info("Face swap engine ready on GPU (models in %s)", model_dir)
+        else:
+            # Loud, because the swap still "works" on CPU — at ~2fps, which
+            # is useless for streaming and easy to misdiagnose as a network
+            # or LiveKit problem.
+            logger.error(
+                "=" * 62
+                + "\n RUNNING ON CPU — face swap will be ~2fps, not usable live."
+                + "\n Cause is almost always an onnxruntime build mismatch:"
+                + "\n   * the CPU `onnxruntime` package shadowing onnxruntime-gpu"
+                + "\n   * onnxruntime-gpu needing cuDNN 9 on a cuDNN 8 image"
+                + "\n Rebuild the image from the provided Dockerfile.\n"
+                + "=" * 62
+            )
+
+    @staticmethod
+    def _active_provider() -> str:
+        try:
+            import onnxruntime as ort
+
+            available = ort.get_available_providers()
+            return (
+                "CUDAExecutionProvider"
+                if "CUDAExecutionProvider" in available
+                else "CPUExecutionProvider"
+            )
+        except Exception:
+            return "unknown"
 
     @staticmethod
     def _download(url: str, dest: str) -> None:

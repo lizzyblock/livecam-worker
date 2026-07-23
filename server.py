@@ -132,6 +132,8 @@ async def healthz():
         "status": "ok",
         "activeSessions": len(sessions),
         "engine": engine is not None,
+        "provider": getattr(engine, "provider", None),
+        "gpu": getattr(engine, "provider", "") == "CUDAExecutionProvider",
         "styles": styles.available() if styles else [],
         "idleSeconds": int(time.time() - last_active) if not sessions else 0,
     }

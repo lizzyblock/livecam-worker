@@ -1,4 +1,6 @@
-# CUDA runtime base for GPU inference.
+# CUDA runtime base for GPU inference. cuDNN 8 here pairs with the pinned
+# onnxruntime-gpu 1.18.1 in requirements.txt — change one and you must
+# change the other, or inference silently drops to CPU.
 FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -22,6 +24,20 @@ RUN pip3 install --upgrade pip setuptools wheel \
 
 COPY requirements.txt .
 RUN pip3 install -r requirements.txt
+
+# insightface depends on the CPU-only `onnxruntime` package. If both it and
+# onnxruntime-gpu are installed, the CPU build wins and every model runs on
+# CPUExecutionProvider at a few frames per second. Remove it and reinstall
+# the GPU build to be certain which one is live.
+RUN pip3 uninstall -y onnxruntime || true \
+    && pip3 install --force-reinstall --no-deps onnxruntime-gpu==1.18.1
+
+# Fail the build here rather than discovering it in production.
+RUN python3 -c "\
+import onnxruntime as ort; \
+p = ort.get_available_providers(); \
+print('onnxruntime providers:', p); \
+assert 'CUDAExecutionProvider' in p, 'CUDA provider missing from build'"
 
 # Drop the compiler once the wheels are built (~300MB back).
 RUN apt-get purge -y build-essential cmake python3-dev \

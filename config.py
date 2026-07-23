@@ -1,11 +1,66 @@
+"""
+Worker configuration.
+
+Every setting comes from the environment. Required values are validated at
+import time and reported together with a readable message — a missing key
+should tell you which one, not raise a bare KeyError from deep in os.py.
+"""
+
 import os
+import sys
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
-LIVEKIT_URL = os.environ["LIVEKIT_URL"]
-LIVEKIT_API_KEY = os.environ["LIVEKIT_API_KEY"]
-LIVEKIT_API_SECRET = os.environ["LIVEKIT_API_SECRET"]
+REQUIRED = {
+    "LIVEKIT_URL": "LiveKit server URL, e.g. wss://your-project.livekit.cloud",
+    "LIVEKIT_API_KEY": "LiveKit API key (must match the backend's)",
+    "LIVEKIT_API_SECRET": "LiveKit API secret (must match the backend's)",
+}
+
+
+def _require() -> dict[str, str]:
+    missing = {k: why for k, why in REQUIRED.items() if not os.environ.get(k)}
+    if missing:
+        lines = [
+            "",
+            "=" * 62,
+            " LiveCam worker cannot start — missing configuration",
+            "=" * 62,
+            "",
+            "Set these environment variables on the pod:",
+            "",
+        ]
+        lines += [f"  {k:<22} {why}" for k, why in missing.items()]
+        lines += [
+            "",
+            "In Runpod: pod menu -> Edit Pod -> Environment Variables.",
+            "The LiveKit values must match your backend exactly, or the",
+            "worker's token will be rejected and it will never join rooms.",
+            "",
+            "=" * 62,
+            "",
+        ]
+        print("\n".join(lines), file=sys.stderr, flush=True)
+        raise SystemExit(1)
+    return {k: os.environ[k] for k in REQUIRED}
+
+
+_cfg = _require()
+
+LIVEKIT_URL = _cfg["LIVEKIT_URL"]
+LIVEKIT_API_KEY = _cfg["LIVEKIT_API_KEY"]
+LIVEKIT_API_SECRET = _cfg["LIVEKIT_API_SECRET"]
+
+# Warn about a common paste error rather than failing mysteriously later.
+if LIVEKIT_URL.startswith("http"):
+    print(
+        f"WARNING: LIVEKIT_URL is {LIVEKIT_URL!r} — LiveKit expects a "
+        "wss:// URL, not http(s)://. Connection will likely fail.",
+        file=sys.stderr,
+        flush=True,
+    )
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/models")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -18,5 +73,19 @@ IDLE_SHUTDOWN_SECONDS = int(os.environ.get("IDLE_SHUTDOWN_SECONDS", "900"))
 RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY")
 RUNPOD_POD_ID = os.environ.get("RUNPOD_POD_ID")
 
-# Needed only for real-time voice conversion.
+# Optional — only needed for real-time voice conversion. Absence disables
+# the voice stage rather than stopping the worker.
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
+
+if not ELEVENLABS_API_KEY:
+    print(
+        "NOTE: ELEVENLABS_API_KEY not set — real-time voice conversion is off. "
+        "Face swap and looks are unaffected.",
+        flush=True,
+    )
+if not (RUNPOD_API_KEY and RUNPOD_POD_ID):
+    print(
+        "NOTE: RUNPOD_API_KEY/RUNPOD_POD_ID not set — idle self-shutdown is "
+        "off. The GPU will keep billing when unused.",
+        flush=True,
+    )
