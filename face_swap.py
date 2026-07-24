@@ -159,6 +159,9 @@ class FaceSwapEngine:
         # which handles unusual angles a little more gracefully at roughly
         # 20x the cost.
         self.fast_blend = os.environ.get("FAST_BLEND", "1") != "0"
+        # Unsharp strength on the swapped face. 0 disables; above ~0.8 the
+        # edges start to look electric.
+        self.sharpen = float(os.environ.get("FACE_SHARPEN", "0.35"))
         self._blend_mask = self._make_blend_mask(128)
         self._cached_targets: list = []
         self._frame_no = 0
@@ -262,12 +265,27 @@ class FaceSwapEngine:
         IM_local[1, 2] -= y1
         bw, bh = x2 - x1, y2 - y1
 
+        # Cubic for the face: it's being upscaled ~3x from the model's
+        # 128px output, where linear interpolation is visibly soft. The mask
+        # is a smooth gradient, so linear is fine and cheaper there.
         warped_face = cv2.warpAffine(
-            face_128, IM_local, (bw, bh), flags=cv2.INTER_LINEAR, borderValue=0
+            face_128, IM_local, (bw, bh), flags=cv2.INTER_CUBIC, borderValue=0
         )
         warped_mask = cv2.warpAffine(
             self._blend_mask, IM_local, (bw, bh), flags=cv2.INTER_LINEAR, borderValue=0
         )
+
+        # Unsharp mask, applied only to the face box.
+        #
+        # The model emits 128x128 regardless of output resolution, so a face
+        # on screen is always an upscale and always slightly soft. This can't
+        # invent detail, but it restores the local contrast that upscaling
+        # flattens — and on a small region it costs well under a millisecond.
+        if self.sharpen > 0:
+            blurred = cv2.GaussianBlur(warped_face, (0, 0), 1.2)
+            warped_face = cv2.addWeighted(
+                warped_face, 1.0 + self.sharpen, blurred, -self.sharpen, 0
+            )
 
         region = frame[y1:y2, x1:x2]
         alpha = warped_mask[:, :, None]

@@ -203,6 +203,36 @@ docker run --gpus all -p 8080:8080 -v livecam-models:/models --env-file .env liv
 Runpod and Modal both autoscale on a queue/HTTP signal — key the scaler on
 `/healthz`'s `activeSessions`.
 
+## Output quality
+
+The ceiling is the model: `inswapper_128` produces a **128x128** face
+whatever the stream resolution. A face filling 350px on screen is therefore
+always an ~3x upscale, and raising `OUT_WIDTH` past 720p only upscales
+further — it adds bandwidth, not detail.
+
+What the worker does about it:
+
+- **Cubic interpolation** when warping the face back (linear is visibly soft
+  at 3x).
+- **Unsharp mask** on the face box only, `FACE_SHARPEN` (default 0.35, 0
+  disables). Restores the local contrast upscaling flattens. Measured at
+  0.7ms on a 360x360 region. It cannot invent detail — it makes what's there
+  read more sharply.
+
+If softness still bothers you, the real fix is a face restoration pass
+(GFPGAN, CodeFormer) after the swap. It genuinely works and it genuinely
+costs 30-80ms per frame, which is the difference between real-time and not.
+Reasonable for rendering a recorded clip; not for a live camera.
+
+**Perceived quality isn't only sharpness.** With the pipeline now fast, two
+settings are worth revisiting — both trade a little of the headroom you just
+won for steadier tracking:
+
+| Setting | Effect |
+|---|---|
+| `DETECT_EVERY=2` (from 3) | Less drift between detections; reduces the slight swim on quick head turns |
+| `DET_SIZE=416` (from 320) | Better landmark accuracy, so the face sits more precisely |
+
 ## Tuning latency
 
 The per-frame budget, roughly, on an L4:
