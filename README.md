@@ -214,7 +214,21 @@ The per-frame budget, roughly, on an L4:
 | Swap | ~12ms | ~12ms |
 | Colour + resize | ~4ms | ~4ms |
 
-**The dominant cost was not the model.** Measured on an L4 at 720p:
+**The blending, not the model, was the whole problem.** InsightFace's
+`paste_back` derives a mask per frame from a pixel difference, then erodes,
+dilates and blurs it with kernels scaled to the face — around 190ms on a 350px
+face, against ~5ms for detection and a couple for the network itself.
+
+Neither cropping nor downscaling fixed it, because the kernel sizes follow the
+face, not the frame. `_fast_paste` replaces the whole thing: a soft elliptical
+mask built **once** at 128x128, warped back with the face, composited over the
+destination bounding box only. Typically ~14% of the frame is touched and the
+cost is a few milliseconds at any output resolution.
+
+Set `FAST_BLEND=0` to restore InsightFace's version, which handles extreme
+angles slightly more gracefully at roughly 20x the cost.
+
+**Earlier findings, for reference:** Measured on an L4 at 720p:
 
 ```
 201ms/frame (transform 195, decode 1, encode 5) | detect 6ms, swap 193ms

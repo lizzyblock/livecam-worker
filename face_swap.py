@@ -134,6 +134,11 @@ class FaceSwapEngine:
         # typical face near 190px — comfortably above the model's 128px
         # output — while cutting the kernel work roughly fourfold.
         self.work_size = int(os.environ.get("BLEND_WORK_SIZE", "384"))
+        # Set FAST_BLEND=0 to fall back to InsightFace's own compositing,
+        # which handles unusual angles a little more gracefully at roughly
+        # 20x the cost.
+        self.fast_blend = os.environ.get("FAST_BLEND", "1") != "0"
+        self._blend_mask = self._make_blend_mask(128)
         self._cached_targets: list = []
         self._frame_no = 0
         logger.info(
@@ -159,6 +164,7 @@ class FaceSwapEngine:
         self._misses = 0
         self._crop_logged = False
         self._crop_fallback_logged = False
+        self._blend_logged = False
         self.t_detect = 0.0
         self.t_swap = 0.0
         self.n_detect = 0
@@ -184,6 +190,72 @@ class FaceSwapEngine:
                 + "=" * 62
             )
 
+    @staticmethod
+    def _make_blend_mask(size: int) -> np.ndarray:
+        """Soft elliptical mask over the aligned face, built once.
+
+        InsightFace derives its mask per frame from a pixel difference, then
+        erodes, dilates and blurs it with kernels scaled to the face — tens of
+        milliseconds every frame. For a talking head the mask barely changes,
+        so a fixed ellipse with a feathered edge is visually equivalent and
+        costs nothing after startup.
+        """
+        m = np.zeros((size, size), dtype=np.float32)
+        cv2.ellipse(
+            m,
+            (size // 2, size // 2),
+            (int(size * 0.42), int(size * 0.50)),
+            0, 0, 360, 1.0, -1,
+        )
+        k = (size // 8) * 2 + 1  # odd kernel, ~16px feather at 128
+        return cv2.GaussianBlur(m, (k, k), 0)
+
+    def _fast_paste(self, frame: np.ndarray, face_128: np.ndarray, M: np.ndarray) -> np.ndarray:
+        """Warp the swapped face back and composite it.
+
+        Only the destination bounding box is touched — typically a few percent
+        of the frame — and the two warps read from a 128x128 source, so the
+        whole operation is a handful of milliseconds regardless of output
+        resolution.
+        """
+        h, w = frame.shape[:2]
+        IM = cv2.invertAffineTransform(M)
+
+        # Where the aligned square lands in the frame.
+        s = face_128.shape[0]
+        corners = np.array(
+            [[0, 0], [s, 0], [s, s], [0, s]], dtype=np.float32
+        ).reshape(1, -1, 2)
+        dst = cv2.transform(corners, IM).reshape(-1, 2)
+
+        x1 = max(0, int(np.floor(dst[:, 0].min())))
+        y1 = max(0, int(np.floor(dst[:, 1].min())))
+        x2 = min(w, int(np.ceil(dst[:, 0].max())))
+        y2 = min(h, int(np.ceil(dst[:, 1].max())))
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            return frame
+
+        # Re-origin the transform so warping writes straight into the box.
+        IM_local = IM.copy()
+        IM_local[0, 2] -= x1
+        IM_local[1, 2] -= y1
+        bw, bh = x2 - x1, y2 - y1
+
+        warped_face = cv2.warpAffine(
+            face_128, IM_local, (bw, bh), flags=cv2.INTER_LINEAR, borderValue=0
+        )
+        warped_mask = cv2.warpAffine(
+            self._blend_mask, IM_local, (bw, bh), flags=cv2.INTER_LINEAR, borderValue=0
+        )
+
+        region = frame[y1:y2, x1:x2]
+        alpha = warped_mask[:, :, None]
+        blended = warped_face.astype(np.float32) * alpha + region.astype(
+            np.float32
+        ) * (1.0 - alpha)
+        frame[y1:y2, x1:x2] = blended.astype(np.uint8)
+        return frame
+
     def _swap_one(self, frame: np.ndarray, target, source: SwapSource) -> np.ndarray:
         """Swap a single face, blending only around it.
 
@@ -197,6 +269,32 @@ class FaceSwapEngine:
         here on a crop around it and the result written back. Identical
         output, a fraction of the pixels.
         """
+        # Fast path: let the model produce the aligned face, then composite
+        # it ourselves. No cropping or rescaling needed — only the face's
+        # destination box is written to.
+        if self.fast_blend:
+            try:
+                face_128, M = self.swapper.get(
+                    frame, target, source, paste_back=False
+                )
+                if not self._blend_logged:
+                    self._blend_logged = True
+                    logger.info(
+                        "Fast blending active: %dx%d face composited directly "
+                        "(InsightFace paste_back bypassed)",
+                        face_128.shape[1],
+                        face_128.shape[0],
+                    )
+                return self._fast_paste(frame, face_128, M)
+            except Exception as e:
+                if not self._crop_fallback_logged:
+                    self._crop_fallback_logged = True
+                    logger.error(
+                        "Fast blending failed (%s) — using InsightFace "
+                        "compositing, which is much slower.",
+                        e,
+                    )
+
         h, w = frame.shape[:2]
         x1, y1, x2, y2 = target.bbox
 

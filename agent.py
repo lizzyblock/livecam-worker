@@ -268,6 +268,11 @@ class SessionAgent:
         cost_total = 0.0
         conv_total = 0.0
         pub_total = 0.0
+        # Report on a timer rather than a frame count: at low frame rates a
+        # frame-based interval can outlast a short test session, which is
+        # exactly when the numbers are most wanted.
+        report_every = 10.0
+        next_report = asyncio.get_event_loop().time() + report_every
 
         async for event in stream:
             if self._closing:
@@ -333,7 +338,8 @@ class SessionAgent:
 
             # Periodic honesty about throughput: average processing cost and
             # how many frames we're skipping to stay current.
-            if frames % 200 == 0:
+            if asyncio.get_event_loop().time() >= next_report and frames:
+                next_report = asyncio.get_event_loop().time() + report_every
                 avg_ms = (cost_total / frames) * 1000
                 logger.info(
                     "%s: %.0fms/frame (transform %.0f, decode %.0f, encode %.0f), "
