@@ -209,6 +209,17 @@ class SessionAgent:
             logger.debug("Ignoring our own %s", publication.name)
             return
         if track.kind == rtc.TrackKind.KIND_VIDEO:
+            # LiveKit simulcasts several quality layers and hands subscribers
+            # the lowest by default. At 320x180 a face is ~60px across —
+            # under what the detector can find — so the swap silently does
+            # nothing and the frame passes through unchanged. Ask for the
+            # full-resolution layer explicitly.
+            try:
+                publication.set_video_quality(rtc.VideoQuality.HIGH)
+                logger.info("Requested HIGH quality layer from %s", participant.identity)
+            except Exception as e:
+                logger.warning("Could not request high quality: %s", e)
+
             logger.info(
                 "Subscribed to video from %s — starting transform",
                 participant.identity,
@@ -261,6 +272,15 @@ class SessionAgent:
                     self._out_w,
                     self._out_h,
                 )
+                if bgr.shape[1] < 480:
+                    logger.warning(
+                        "Incoming video is only %dx%d — faces are too small to "
+                        "detect reliably and the swap will pass through. The "
+                        "publisher should disable simulcast or raise its "
+                        "encoding.",
+                        bgr.shape[1],
+                        bgr.shape[0],
+                    )
             self._publish_video(bgr)
 
     def _transform(self, bgr: np.ndarray, source, style) -> np.ndarray:
