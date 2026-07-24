@@ -108,14 +108,20 @@ class DispatchBody(BaseModel):
 
 
 def _worker_token(room: str) -> str:
-    """Token for the worker to join the room, publish, and subscribe."""
+    """Token for the worker to join the room, publish, and subscribe.
+
+    NOTE: `hidden` must stay off. A hidden participant is invisible to the
+    others *along with its tracks* — the transformed video would be published
+    into a room where nobody can subscribe to it. The streamer seeing a
+    "LiveCam" participant in the list is a small cosmetic cost for output
+    that actually reaches them.
+    """
     grant = api.VideoGrants(
         room=room,
         room_join=True,
         can_publish=True,
         can_subscribe=True,
-        # Hidden so the streamer doesn't see the worker as a participant.
-        hidden=True,
+        can_publish_data=True,
     )
     return (
         api.AccessToken(config.LIVEKIT_API_KEY, config.LIVEKIT_API_SECRET)
@@ -184,16 +190,58 @@ async def stop(body: DispatchBody):
 
 
 async def _watch(room: str, agent: SessionAgent) -> None:
-    """Reap the session when the room empties (streamer disconnects)."""
+    """Reap the session once the streamer has left.
+
+    Two rules keep this from cutting a session short:
+
+    1. A join grace period. The API dispatches us *before* it hands the
+       browser its token, so we are always in the room first. Reaping on an
+       empty room immediately would kill every session before it starts.
+    2. Only reap after someone has actually been seen. A room that never had
+       a participant is one where the streamer is still connecting — not one
+       they have left.
+    """
+    join_grace_seconds = 90
+    empty_checks_before_reap = 3  # ~45s of confirmed emptiness
+    waited = 0
+    seen_participant = False
+    empty_streak = 0
+
     while room in sessions:
         await asyncio.sleep(15)
-        # If only the worker remains, tear down.
-        if len(agent.room.remote_participants) == 0:
-            await agent.stop()
-            sessions.pop(room, None)
-            touch()
-            logger.info("Reaped empty room %s", room)
-            return
+        waited += 15
+
+        participants = len(agent.room.remote_participants)
+        if participants > 0:
+            seen_participant = True
+            empty_streak = 0
+            continue
+
+        if not seen_participant:
+            if waited < join_grace_seconds:
+                logger.debug(
+                    "Room %s still empty after %ds — within join grace",
+                    room,
+                    waited,
+                )
+                continue
+            logger.warning(
+                "Room %s had no participant within %ds — the browser never "
+                "joined. Reaping.",
+                room,
+                join_grace_seconds,
+            )
+            break
+
+        empty_streak += 1
+        if empty_streak >= empty_checks_before_reap:
+            logger.info("Streamer left room %s — reaping", room)
+            break
+
+    if room in sessions:
+        await agent.stop()
+        sessions.pop(room, None)
+        touch()
 
 
 if __name__ == "__main__":

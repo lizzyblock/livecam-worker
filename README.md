@@ -16,6 +16,10 @@ Streamer browser ──cam track──► LiveKit room ◄──joins── Work
 
 1. NestJS API mints a room token and `POST`s `/dispatch` here with the room
    name + face config (a short-lived signed portrait URL).
+
+   The worker joins as a normal (visible) participant. It must **not** use a
+   `hidden` grant: LiveKit hides a hidden participant's tracks along with the
+   participant, so the transformed video would never reach the browser.
 2. Worker analyzes the portrait **once** → cached identity embedding.
 3. Each incoming frame: detect face → swap toward the identity → publish.
 4. Mid-session, the client can send a LiveKit data message

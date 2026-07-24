@@ -1,7 +1,8 @@
 """
 LiveCam GPU worker — LiveKit agent.
 
-Joins a room as a hidden participant and republishes two transformed tracks:
+Joins the streamer's room as a second participant and republishes two
+transformed tracks:
 
   video -> `livecam-processed`   face swap, then the look/style grade
   audio -> `livecam-audio`       speech-to-speech voice conversion
@@ -76,6 +77,18 @@ class SessionAgent:
 
         self.room.on("track_subscribed", self._on_track)
         self.room.on("data_received", self._on_data)
+        self.room.on(
+            "participant_connected",
+            lambda p: logger.info(
+                "Participant %s joined %s", p.identity, self.room_name
+            ),
+        )
+        self.room.on(
+            "participant_disconnected",
+            lambda p: logger.info(
+                "Participant %s left %s", p.identity, self.room_name
+            ),
+        )
         await self.room.connect(config.LIVEKIT_URL, token)
         logger.info("Agent joined room %s", self.room_name)
 
@@ -183,6 +196,10 @@ class SessionAgent:
         if publication.name in (PROCESSED_VIDEO, PROCESSED_AUDIO):
             return
         if track.kind == rtc.TrackKind.KIND_VIDEO:
+            logger.info(
+                "Subscribed to video from %s — starting transform",
+                participant.identity,
+            )
             self._tasks.append(
                 asyncio.create_task(self._process_video(rtc.VideoStream(track)))
             )
