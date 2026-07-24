@@ -130,6 +130,10 @@ class FaceSwapEngine:
         # How much bigger than the face box to composite over. Below ~1.6 the
         # blend can clip; above ~2.5 there's no benefit, just more pixels.
         self.crop_scale = float(os.environ.get("BLEND_CROP_SCALE", "2.0"))
+        # Longest edge of the region the blend actually runs on. 384 keeps a
+        # typical face near 190px — comfortably above the model's 128px
+        # output — while cutting the kernel work roughly fourfold.
+        self.work_size = int(os.environ.get("BLEND_WORK_SIZE", "384"))
         self._cached_targets: list = []
         self._frame_no = 0
         logger.info(
@@ -211,17 +215,38 @@ class FaceSwapEngine:
         # Confirm the fast path is live, once per process.
         if not self._crop_logged:
             self._crop_logged = True
+            eff = min(self.work_size, max(cx2 - cx1, cy2 - cy1))
             logger.info(
-                "Crop-scoped blending active: compositing %dx%d instead of "
-                "%dx%d (%.0f%% of the pixels)",
+                "Crop-scoped blending active: %dx%d region, blended at ~%dpx "
+                "(was %dx%d full-frame)",
                 cx2 - cx1,
                 cy2 - cy1,
+                eff,
                 w,
                 h,
-                100.0 * ((cx2 - cx1) * (cy2 - cy1)) / (w * h),
             )
 
         crop = frame[cy1:cy2, cx1:cx2]
+        ch, cw = crop.shape[:2]
+
+        # Work at a reduced scale.
+        #
+        # InsightFace sizes its blending kernels from the *face*, not the
+        # frame: a 350px face yields a 34x34 erosion and a 35x35 Gaussian.
+        # Cropping shrinks the array but leaves those kernels untouched, so
+        # it alone bought far less than expected. Halving the face size
+        # quarters that work.
+        #
+        # Little is lost: the network emits a 128x128 face regardless, so
+        # anything above that is already upscaling.
+        scale = 1.0
+        if max(cw, ch) > self.work_size:
+            scale = self.work_size / float(max(cw, ch))
+            crop = cv2.resize(
+                crop,
+                (max(1, int(cw * scale)), max(1, int(ch * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
 
         # Re-express the face's geometry in crop coordinates.
         #
@@ -235,11 +260,15 @@ class FaceSwapEngine:
         orig_kps = target.kps
         orig_bbox = target.bbox
         try:
-            target.kps = orig_kps - origin
-            target.bbox = orig_bbox - np.array(
-                [cx1, cy1, cx1, cy1], dtype=np.float32
-            )
+            target.kps = (orig_kps - origin) * scale
+            target.bbox = (
+                orig_bbox - np.array([cx1, cy1, cx1, cy1], dtype=np.float32)
+            ) * scale
             swapped = self.swapper.get(crop, target, source, paste_back=True)
+            if scale != 1.0:
+                swapped = cv2.resize(
+                    swapped, (cw, ch), interpolation=cv2.INTER_LINEAR
+                )
         except Exception as e:
             if not self._crop_fallback_logged:
                 self._crop_fallback_logged = True
