@@ -53,6 +53,37 @@ LIVEKIT_URL = _cfg["LIVEKIT_URL"]
 LIVEKIT_API_KEY = _cfg["LIVEKIT_API_KEY"]
 LIVEKIT_API_SECRET = _cfg["LIVEKIT_API_SECRET"]
 
+def _fingerprint(secret: str) -> str:
+    """Short, non-reversible identifier for a credential.
+
+    Printed by both the worker and the API so the two can be compared at a
+    glance. A mismatch here is the cause of every "invalid token" 401, and
+    without this you're left comparing invisible strings across two dashboards.
+    """
+    import hashlib
+
+    return hashlib.sha256(secret.encode()).hexdigest()[:8]
+
+
+print(
+    "LiveKit config | url=%s | key=%s | secret_fp=%s"
+    % (LIVEKIT_URL, LIVEKIT_API_KEY, _fingerprint(LIVEKIT_API_SECRET)),
+    flush=True,
+)
+
+# Whitespace from copy-paste produces an invalid token with no clue why.
+if LIVEKIT_API_KEY != LIVEKIT_API_KEY.strip() or (
+    LIVEKIT_API_SECRET != LIVEKIT_API_SECRET.strip()
+):
+    print(
+        "WARNING: LiveKit credentials have leading/trailing whitespace. "
+        "Stripping them — but fix the env var.",
+        file=sys.stderr,
+        flush=True,
+    )
+    LIVEKIT_API_KEY = LIVEKIT_API_KEY.strip()
+    LIVEKIT_API_SECRET = LIVEKIT_API_SECRET.strip()
+
 # Warn about a common paste error rather than failing mysteriously later.
 if LIVEKIT_URL.startswith("http"):
     print(
