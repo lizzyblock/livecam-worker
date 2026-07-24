@@ -18,6 +18,7 @@ Design notes for real-time use:
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 from dataclasses import dataclass
@@ -153,6 +154,8 @@ class FaceSwapEngine:
 
         self._hits = 0
         self._misses = 0
+        self._crop_logged = False
+        self._crop_fallback_logged = False
         self.t_detect = 0.0
         self.t_swap = 0.0
         self.n_detect = 0
@@ -206,18 +209,40 @@ class FaceSwapEngine:
         if cx2 - cx1 < 32 or cy2 - cy1 < 32:
             return self.swapper.get(frame, target, source, paste_back=True)
 
+        # Confirm the fast path is live, once per process.
+        if not self._crop_logged:
+            self._crop_logged = True
+            logger.info(
+                "Crop-scoped blending active: compositing %dx%d instead of "
+                "%dx%d (%.0f%% of the pixels)",
+                cx2 - cx1,
+                cy2 - cy1,
+                w,
+                h,
+                100.0 * ((cx2 - cx1) * (cy2 - cy1)) / (w * h),
+            )
+
         crop = frame[cy1:cy2, cx1:cx2]
 
-        # Re-express the face's geometry in crop coordinates.
+        # Re-express the face's geometry in crop coordinates. deepcopy keeps
+        # whatever class InsightFace used rather than assuming a constructor
+        # signature, and the arrays involved are tiny.
         try:
-            shifted = target.__class__(dict(target))
+            shifted = copy.deepcopy(target)
             shifted.kps = target.kps - np.array([cx1, cy1], dtype=np.float32)
             shifted.bbox = target.bbox - np.array(
                 [cx1, cy1, cx1, cy1], dtype=np.float32
             )
-        except Exception:
-            # Any surprise in the Face type — fall back to the slow path
-            # rather than dropping the swap.
+        except Exception as e:
+            # Falling back silently would leave the slow path running while
+            # the logs claim the optimisation is active — say so, once.
+            if not self._crop_fallback_logged:
+                self._crop_fallback_logged = True
+                logger.error(
+                    "Crop-scoped blending unavailable (%s) — falling back to "
+                    "full-frame compositing, which costs ~10x more per frame.",
+                    e,
+                )
             return self.swapper.get(frame, target, source, paste_back=True)
 
         swapped = self.swapper.get(crop, shifted, source, paste_back=True)
