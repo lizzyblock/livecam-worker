@@ -63,6 +63,8 @@ class SessionAgent:
 
         self.room = rtc.Room()
         self._video_out: Optional[rtc.VideoSource] = None
+        self._out_w = 1280
+        self._out_h = 720
         self._audio_out: Optional[rtc.AudioSource] = None
         self._audio_queue = FrameQueue(AUDIO_FRAME_SAMPLES)
         self._lock = asyncio.Lock()
@@ -92,7 +94,11 @@ class SessionAgent:
         await self.room.connect(config.LIVEKIT_URL, token)
         logger.info("Agent joined room %s", self.room_name)
 
-        self._video_out = rtc.VideoSource(1280, 720)
+        # Declared once and never changed. Every frame we publish is resized
+        # to match: a VideoSource declared at one size receiving frames at
+        # another is interpreted with the wrong stride, which renders as
+        # rainbow smearing rather than an error.
+        self._video_out = rtc.VideoSource(self._out_w, self._out_h)
         video_track = rtc.LocalVideoTrack.create_video_track(
             PROCESSED_VIDEO, self._video_out
         )
@@ -211,6 +217,7 @@ class SessionAgent:
     async def _process_video(self, stream: rtc.VideoStream) -> None:
         frame_interval = 1.0 / max(1, config.TARGET_FPS)
         last = 0.0
+        frames = 0
         async for event in stream:
             if self._closing:
                 return
@@ -221,6 +228,8 @@ class SessionAgent:
 
             frame = event.frame
             bgr = self._to_bgr(frame)
+            if bgr is None:
+                continue
 
             async with self._lock:
                 source = self.source
@@ -238,7 +247,17 @@ class SessionAgent:
                 except Exception as e:
                     logger.debug("style error: %s", e)
 
-            self._publish_video(bgr, frame.width, frame.height)
+            frames += 1
+            if frames == 1:
+                logger.info(
+                    "First frame processed for %s (in %dx%d, out %dx%d)",
+                    self.room_name,
+                    bgr.shape[1],
+                    bgr.shape[0],
+                    self._out_w,
+                    self._out_h,
+                )
+            self._publish_video(bgr)
 
     async def _process_audio(self, stream: rtc.AudioStream) -> None:
         """Mic in -> phrase chunks -> speech-to-speech -> output queue.
@@ -302,18 +321,36 @@ class SessionAgent:
     # -- helpers ---------------------------------------------------
 
     @staticmethod
-    def _to_bgr(frame: rtc.VideoFrame) -> np.ndarray:
+    def _to_bgr(frame: rtc.VideoFrame) -> Optional[np.ndarray]:
+        """Convert an incoming frame to BGR.
+
+        Dimensions come from the *converted* buffer, not the source frame —
+        conversion can pad, and reshaping with the wrong width shears the
+        image into diagonal colour bands.
+        """
         rgba = frame.convert(rtc.VideoBufferType.RGBA)
-        arr = np.frombuffer(rgba.data, dtype=np.uint8).reshape(
-            frame.height, frame.width, 4
-        )
+        w = getattr(rgba, "width", frame.width)
+        h = getattr(rgba, "height", frame.height)
+
+        buf = np.frombuffer(rgba.data, dtype=np.uint8)
+        expected = w * h * 4
+        if buf.size < expected:
+            logger.debug("Short frame buffer (%d < %d), skipping", buf.size, expected)
+            return None
+        arr = buf[:expected].reshape(h, w, 4)
         return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
 
-    def _publish_video(self, bgr: np.ndarray, w: int, h: int) -> None:
+    def _publish_video(self, bgr: np.ndarray) -> None:
+        """Publish at the source's declared size, always."""
         if self._video_out is None:
             return
+        if bgr.shape[1] != self._out_w or bgr.shape[0] != self._out_h:
+            bgr = cv2.resize(bgr, (self._out_w, self._out_h))
+
         rgba = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGBA)
-        out = rtc.VideoFrame(w, h, rtc.VideoBufferType.RGBA, rgba.tobytes())
+        out = rtc.VideoFrame(
+            self._out_w, self._out_h, rtc.VideoBufferType.RGBA, rgba.tobytes()
+        )
         self._video_out.capture_frame(out)
 
 
