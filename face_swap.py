@@ -53,9 +53,15 @@ MIN_MODEL_BYTES = 100 * 1024 * 1024
 
 @dataclass
 class SwapSource:
-    """A prepared reference identity, ready to swap onto frames."""
+    """A prepared reference identity, ready to swap onto frames.
 
-    embedding: np.ndarray
+    The field MUST be called `normed_embedding`: InsightFace's swapper reads
+    `source_face.normed_embedding` directly off whatever it's handed. Any
+    other name raises AttributeError on every frame — which, if the caller
+    swallows it, looks exactly like a swap that quietly does nothing.
+    """
+
+    normed_embedding: np.ndarray
     name: str
 
 
@@ -88,6 +94,8 @@ class FaceSwapEngine:
             providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
         )
 
+        self._hits = 0
+        self._misses = 0
         self.provider = self._active_provider()
         if self.provider == "CUDAExecutionProvider":
             logger.info("Face swap engine ready on GPU (models in %s)", model_dir)
@@ -183,22 +191,41 @@ class FaceSwapEngine:
             return None
         # Largest face wins if the portrait has several.
         face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-        return SwapSource(embedding=face.normed_embedding, name=name)
+        logger.info(
+            "Prepared source %r from a %dx%d face region",
+            name,
+            int(face.bbox[2] - face.bbox[0]),
+            int(face.bbox[3] - face.bbox[1]),
+        )
+        return SwapSource(normed_embedding=face.normed_embedding, name=name)
 
     def swap_frame(self, frame_bgr: np.ndarray, source: SwapSource) -> np.ndarray:
         """Swap the streamer's face toward the source identity.
 
         Returns the original frame unchanged when no face is present, so the
-        output track never drops.
+        output track never drops. Detection misses are counted and reported
+        periodically — a swap that silently does nothing is the single most
+        confusing failure mode here, so it should never be silent.
         """
         targets = self.analyzer.get(frame_bgr)
         if not targets:
+            self._misses += 1
+            if self._misses in (30, 300) or self._misses % 900 == 0:
+                logger.warning(
+                    "No face detected in %d frames. Check lighting and that "
+                    "you're facing the camera.",
+                    self._misses,
+                )
             return frame_bgr
 
         out = frame_bgr
         for target in targets:
             # `paste_back=True` blends the swapped face back into the frame.
             out = self.swapper.get(out, target, source, paste_back=True)
+
+        self._hits += 1
+        if self._hits == 1:
+            logger.info("First successful swap — %d face(s) in frame", len(targets))
         return out
 
 

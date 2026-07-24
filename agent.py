@@ -70,6 +70,8 @@ class SessionAgent:
         self._lock = asyncio.Lock()
         self._tasks: list[asyncio.Task] = []
         self._closing = False
+        self._swap_errors = 0
+        self._style_errors = 0
 
     # -- lifecycle -------------------------------------------------
 
@@ -209,16 +211,20 @@ class SessionAgent:
             logger.debug("Ignoring our own %s", publication.name)
             return
         if track.kind == rtc.TrackKind.KIND_VIDEO:
-            # LiveKit simulcasts several quality layers and hands subscribers
-            # the lowest by default. At 320x180 a face is ~60px across —
-            # under what the detector can find — so the swap silently does
-            # nothing and the frame passes through unchanged. Ask for the
-            # full-resolution layer explicitly.
-            try:
-                publication.set_video_quality(rtc.VideoQuality.HIGH)
-                logger.info("Requested HIGH quality layer from %s", participant.identity)
-            except Exception as e:
-                logger.warning("Could not request high quality: %s", e)
+            # Belt and braces on resolution. The publisher disables simulcast
+            # so there's only one full-quality layer to receive — this just
+            # covers older clients that still send several. The enum is named
+            # inconsistently across SDK versions, so try each and stay quiet
+            # if none apply.
+            for attr in ("HIGH", "QUALITY_HIGH", "VIDEO_QUALITY_HIGH"):
+                quality = getattr(rtc.VideoQuality, attr, None)
+                if quality is not None:
+                    try:
+                        publication.set_video_quality(quality)
+                        logger.debug("Requested %s layer", attr)
+                    except Exception as e:
+                        logger.debug("set_video_quality failed: %s", e)
+                    break
 
             logger.info(
                 "Subscribed to video from %s — starting transform",
@@ -284,17 +290,34 @@ class SessionAgent:
             self._publish_video(bgr)
 
     def _transform(self, bgr: np.ndarray, source, style) -> np.ndarray:
-        """Swap then grade. Runs in a worker thread, never on the loop."""
+        """Swap then grade. Runs in a worker thread, never on the loop.
+
+        Errors are reported, not swallowed. A per-frame failure logged at
+        debug level is invisible in production and presents as a swap that
+        does nothing — so the first occurrence is logged loudly and the rest
+        are throttled to keep the log readable.
+        """
         if source is not None:
             try:
                 bgr = self.engine.swap_frame(bgr, source)
             except Exception as e:
-                logger.debug("swap error: %s", e)
+                self._swap_errors += 1
+                if self._swap_errors == 1 or self._swap_errors % 300 == 0:
+                    logger.error(
+                        "Face swap failing (%d frames): %s",
+                        self._swap_errors,
+                        e,
+                        exc_info=self._swap_errors == 1,
+                    )
         if style is not None:
             try:
                 bgr = style(bgr)
             except Exception as e:
-                logger.debug("style error: %s", e)
+                self._style_errors += 1
+                if self._style_errors == 1 or self._style_errors % 300 == 0:
+                    logger.error(
+                        "Look failing (%d frames): %s", self._style_errors, e
+                    )
         return bgr
 
     async def _process_audio(self, stream: rtc.AudioStream) -> None:
