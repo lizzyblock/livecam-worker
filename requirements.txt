@@ -6,11 +6,11 @@ livekit-api>=0.7
 # Real-time face swap
 insightface>=0.7.3          # inswapper_128 + buffalo_l face analysis
 
-# PINNED DELIBERATELY. onnxruntime-gpu 1.19+ requires cuDNN 9, but the CUDA
-# base image ships cuDNN 8. A mismatch doesn't error — it silently falls back
-# to CPUExecutionProvider and runs at ~2fps. 1.18.1 is the last release that
-# pairs with CUDA 12.x + cuDNN 8.
-onnxruntime-gpu==1.18.1
+# NOTE: onnxruntime-gpu is deliberately NOT listed here. insightface depends
+# on the CPU `onnxruntime`, and both packages install into the same directory
+# — whichever pip touches last wins. The Dockerfile therefore removes all
+# variants and installs the GPU build as the final step. Adding it here would
+# reintroduce the ordering race.
 
 opencv-python-headless>=4.9
 

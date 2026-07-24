@@ -98,19 +98,34 @@ class FaceSwapEngine:
             logger.error(
                 "=" * 62
                 + "\n RUNNING ON CPU — face swap will be ~2fps, not usable live."
-                + "\n Cause is almost always an onnxruntime build mismatch:"
-                + "\n   * the CPU `onnxruntime` package shadowing onnxruntime-gpu"
-                + "\n   * onnxruntime-gpu needing cuDNN 9 on a cuDNN 8 image"
-                + "\n Rebuild the image from the provided Dockerfile.\n"
+                + "\n Check the providers line logged just above:"
+                + "\n   'AzureExecutionProvider, CPUExecutionProvider'"
+                + "\n       -> the CPU-only onnxruntime package is installed"
+                + "\n   CUDA listed but unused"
+                + "\n       -> CUDA/cuDNN version mismatch with the base image"
+                + "\n"
+                + "\n onnxruntime-gpu >=1.19 needs CUDA 12 + cuDNN 9."
+                + "\n Rebuild from the provided Dockerfile.\n"
                 + "=" * 62
             )
 
     @staticmethod
     def _active_provider() -> str:
+        """Which provider onnxruntime will actually use.
+
+        Logged verbatim because the failure mode is silent: a CPU-only
+        onnxruntime lists 'AzureExecutionProvider, CPUExecutionProvider',
+        while the GPU build lists 'TensorrtExecutionProvider,
+        CUDAExecutionProvider, CPUExecutionProvider'. Seeing the real list
+        tells you immediately which package is installed.
+        """
         try:
             import onnxruntime as ort
 
             available = ort.get_available_providers()
+            logger.info(
+                "onnxruntime %s providers: %s", ort.__version__, available
+            )
             return (
                 "CUDAExecutionProvider"
                 if "CUDAExecutionProvider" in available

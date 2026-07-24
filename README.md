@@ -104,14 +104,24 @@ changing your Python code doesn't re-run pip at all.
 
 Three things that trip up this image specifically:
 
-- **onnxruntime silently falls back to CPU.** This is the nastiest one,
-  because nothing errors — the models load, the worker reports healthy, and
-  face swap runs at ~2fps. Two separate causes, both handled in the
-  Dockerfile: insightface depends on the CPU-only `onnxruntime` package which
-  shadows `onnxruntime-gpu`, and onnxruntime-gpu 1.19+ needs cuDNN 9 while the
-  CUDA base image ships cuDNN 8. The build now asserts that
-  `CUDAExecutionProvider` is present and fails loudly if it isn't.
-  **Always check `"gpu": true` on `/healthz`, not just `"engine": true`.**
+- **onnxruntime silently falls back to CPU.** The nastiest failure here,
+  because nothing errors: models load, the worker reports healthy, and face
+  swap runs at ~2fps. Two independent causes, both handled:
+
+  1. *Package shadowing.* insightface depends on the CPU-only `onnxruntime`.
+     Both packages install into the same directory, so whichever pip touches
+     last wins. The Dockerfile removes every variant and installs
+     `onnxruntime-gpu` as the final step.
+  2. *CUDA version mismatch.* PyPI's default `onnxruntime-gpu` wheel is built
+     for **CUDA 11.8 up to 1.18**, and **CUDA 12 + cuDNN 9 from 1.19**. Pair
+     1.18 with a CUDA 12 image and it loads but can't see the GPU. The base
+     image is therefore `12.4.1-cudnn-` (cuDNN 9) with `onnxruntime-gpu>=1.19`.
+
+  **Diagnosing it:** the startup log prints the real provider list.
+  `AzureExecutionProvider, CPUExecutionProvider` means the CPU package is
+  installed. `TensorrtExecutionProvider, CUDAExecutionProvider, ...` means the
+  GPU build is live. **Check `"gpu": true` on `/healthz`, not just
+  `"engine": true`.**
 
 - **insightface compiles from source.** It needs `build-essential` and
   `python3-dev`, and its `setup.py` imports numpy and Cython at build time —

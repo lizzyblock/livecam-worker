@@ -1,7 +1,14 @@
-# CUDA runtime base for GPU inference. cuDNN 8 here pairs with the pinned
-# onnxruntime-gpu 1.18.1 in requirements.txt — change one and you must
-# change the other, or inference silently drops to CPU.
-FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+# ─────────────────────────────────────────────────────────────
+# GPU base. THIS TAG AND THE onnxruntime-gpu VERSION ARE A PAIR.
+#
+#   onnxruntime-gpu >= 1.19  ->  CUDA 12 + cuDNN 9   (PyPI default wheel)
+#   onnxruntime-gpu <= 1.18  ->  CUDA 11.8           (PyPI default wheel)
+#
+# The 1.18 CUDA-12 wheels only exist on a separate Microsoft index, which is
+# why pinning 1.18 here quietly produced a CPU-only runtime. Note the tag is
+# `-cudnn-` (cuDNN 9), not `-cudnn8-`.
+# ─────────────────────────────────────────────────────────────
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
@@ -25,19 +32,18 @@ RUN pip3 install --upgrade pip setuptools wheel \
 COPY requirements.txt .
 RUN pip3 install -r requirements.txt
 
-# insightface depends on the CPU-only `onnxruntime` package. If both it and
-# onnxruntime-gpu are installed, the CPU build wins and every model runs on
-# CPUExecutionProvider at a few frames per second. Remove it and reinstall
-# the GPU build to be certain which one is live.
-RUN pip3 uninstall -y onnxruntime || true \
-    && pip3 install --force-reinstall --no-deps onnxruntime-gpu==1.18.1
+# insightface depends on the CPU-only `onnxruntime`. Both packages install
+# into the same `onnxruntime/` directory, so whichever lands last wins and
+# the loser's binaries are overwritten. Remove every variant, then install
+# only the GPU build — this must be the final pip step.
+RUN pip3 uninstall -y onnxruntime onnxruntime-gpu onnxruntime-openvino || true \
+    && pip3 install "onnxruntime-gpu>=1.19,<2"
 
-# Log which providers the build produced. This is informational only —
-# CI runners have no GPU, so a hard assert here would fail every cloud build.
-# The real check happens at runtime and is reported on /healthz as "gpu".
+# Informational: CI runners have no GPU, so this can't be a hard assert.
+# The authoritative check is at runtime, reported as "gpu" on /healthz.
 RUN python3 -c "\
 import onnxruntime as ort; \
-print('onnxruntime build providers:', ort.get_available_providers())" || true
+print('onnxruntime', ort.__version__, 'providers:', ort.get_available_providers())" || true
 
 # Drop the compiler once the wheels are built (~300MB back).
 RUN apt-get purge -y build-essential cmake python3-dev \
