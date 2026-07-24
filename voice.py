@@ -130,7 +130,18 @@ class VoiceConverter:
             if resp.status_code != 200:
                 logger.warning("STS failed %s: %s", resp.status_code, resp.text[:200])
                 return None
-            return np.frombuffer(resp.content, dtype=np.int16)
+
+            # The response is a raw PCM stream, so a chunk boundary can land
+            # mid-sample and leave an odd byte count. np.frombuffer rejects
+            # that outright ("buffer size must be a multiple of element
+            # size"), dropping audio that was otherwise fine — so trim the
+            # stray byte rather than losing the chunk.
+            data = resp.content
+            if len(data) < 2:
+                return None
+            if len(data) % 2:
+                data = data[: len(data) - 1]
+            return np.frombuffer(data, dtype=np.int16)
         except Exception as e:
             logger.warning("STS error: %s", e)
             return None
