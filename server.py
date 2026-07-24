@@ -126,6 +126,20 @@ def _worker_token(room: str) -> str:
     )
 
 
+@app.get("/")
+async def root():
+    """Friendly landing so hitting the bare host isn't a bare 404."""
+    return {
+        "service": "LiveCam GPU worker",
+        "ready": engine is not None,
+        "endpoints": {
+            "health": "/healthz",
+            "dispatch": "POST /dispatch",
+            "stop": "POST /stop",
+        },
+    }
+
+
 @app.get("/healthz")
 async def healthz():
     return {
