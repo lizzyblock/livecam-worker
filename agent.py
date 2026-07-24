@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import cv2
@@ -63,8 +65,12 @@ class SessionAgent:
 
         self.room = rtc.Room()
         self._video_out: Optional[rtc.VideoSource] = None
-        self._out_w = 1280
-        self._out_h = 720
+        # Output resolution. Every stage — conversion, swap paste-back,
+        # encode — scales with pixel count, so this is the bluntest and most
+        # effective lever when a session can't keep up. 960x540 costs about
+        # 45% less work than 720p and is hard to tell apart on a webcam feed.
+        self._out_w = int(os.environ.get("OUT_WIDTH", "1280"))
+        self._out_h = int(os.environ.get("OUT_HEIGHT", "720"))
         self._audio_out: Optional[rtc.AudioSource] = None
         self._audio_queue = FrameQueue(AUDIO_FRAME_SAMPLES)
         self._lock = asyncio.Lock()
@@ -72,6 +78,12 @@ class SessionAgent:
         self._closing = False
         self._swap_errors = 0
         self._style_errors = 0
+
+        # A single dedicated thread for every GPU call. asyncio.to_thread
+        # hands work to an arbitrary pool thread, and switching the CUDA
+        # context between threads costs more than the inference itself —
+        # pinning it to one thread keeps the context warm.
+        self._gpu = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
 
     # -- lifecycle -------------------------------------------------
 
@@ -126,6 +138,7 @@ class SessionAgent:
             t.cancel()
         if self.converter:
             await self.converter.close()
+        self._gpu.shutdown(wait=False)
         await self.room.disconnect()
         logger.info("Agent left room %s", self.room_name)
 
@@ -253,6 +266,8 @@ class SessionAgent:
         busy = False
         dropped = 0
         cost_total = 0.0
+        conv_total = 0.0
+        pub_total = 0.0
 
         async for event in stream:
             if self._closing:
@@ -266,9 +281,12 @@ class SessionAgent:
             busy = True
 
             frame = event.frame
+            t_conv = asyncio.get_event_loop().time()
             bgr = self._to_bgr(frame)
             if bgr is None:
+                busy = False
                 continue
+            conv_total += asyncio.get_event_loop().time() - t_conv
 
             async with self._lock:
                 source = self.source
@@ -280,7 +298,10 @@ class SessionAgent:
             # of every frame. Off-thread they don't.
             started = asyncio.get_event_loop().time()
             try:
-                bgr = await asyncio.to_thread(self._transform, bgr, source, style)
+                loop = asyncio.get_event_loop()
+                bgr = await loop.run_in_executor(
+                    self._gpu, self._transform, bgr, source, style
+                )
             except Exception as e:
                 logger.debug("transform error: %s", e)
             finally:
@@ -306,18 +327,25 @@ class SessionAgent:
                         bgr.shape[1],
                         bgr.shape[0],
                     )
+            t_pub = asyncio.get_event_loop().time()
             self._publish_video(bgr)
+            pub_total += asyncio.get_event_loop().time() - t_pub
 
             # Periodic honesty about throughput: average processing cost and
             # how many frames we're skipping to stay current.
             if frames % 200 == 0:
                 avg_ms = (cost_total / frames) * 1000
                 logger.info(
-                    "%s: %.0fms/frame avg, ~%.0f fps capacity, %d dropped",
+                    "%s: %.0fms/frame (transform %.0f, decode %.0f, encode %.0f), "
+                    "~%.0f fps, %d dropped | %s",
                     self.room_name,
+                    ((cost_total + conv_total + pub_total) / frames) * 1000,
                     avg_ms,
+                    (conv_total / frames) * 1000,
+                    (pub_total / frames) * 1000,
                     1000 / avg_ms if avg_ms > 0 else 0,
                     dropped,
+                    self.engine.timing_summary(),
                 )
 
     def _transform(self, bgr: np.ndarray, source, style) -> np.ndarray:
@@ -414,23 +442,34 @@ class SessionAgent:
 
     @staticmethod
     def _to_bgr(frame: rtc.VideoFrame) -> Optional[np.ndarray]:
-        """Convert an incoming frame to BGR.
+        """Convert an incoming frame to BGR as cheaply as possible.
 
-        Dimensions come from the *converted* buffer, not the source frame —
-        conversion can pad, and reshaping with the wrong width shears the
-        image into diagonal colour bands.
+        WebRTC delivers I420. Going I420 -> RGBA -> BGR touches every pixel
+        twice and allocates a 3.7MB intermediate at 720p; converting straight
+        from I420 halves that. RGBA is kept as a fallback for any frame type
+        that won't convert.
         """
+        try:
+            i420 = frame.convert(rtc.VideoBufferType.I420)
+            w = getattr(i420, "width", frame.width)
+            h = getattr(i420, "height", frame.height)
+            buf = np.frombuffer(i420.data, dtype=np.uint8)
+            expected = w * h * 3 // 2
+            if buf.size >= expected:
+                yuv = buf[:expected].reshape(h * 3 // 2, w)
+                return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+        except Exception:
+            pass  # fall through to RGBA
+
         rgba = frame.convert(rtc.VideoBufferType.RGBA)
         w = getattr(rgba, "width", frame.width)
         h = getattr(rgba, "height", frame.height)
-
         buf = np.frombuffer(rgba.data, dtype=np.uint8)
         expected = w * h * 4
         if buf.size < expected:
             logger.debug("Short frame buffer (%d < %d), skipping", buf.size, expected)
             return None
-        arr = buf[:expected].reshape(h, w, 4)
-        return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+        return cv2.cvtColor(buf[:expected].reshape(h, w, 4), cv2.COLOR_RGBA2BGR)
 
     def _publish_video(self, bgr: np.ndarray) -> None:
         """Publish at the source's declared size, always."""

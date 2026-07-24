@@ -89,7 +89,21 @@ class FaceSwapEngine:
         os.makedirs(model_dir, exist_ok=True)
 
         det = det_size or int(os.environ.get("DET_SIZE", "320"))
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        # EXHAUSTIVE is onnxruntime's default and it re-benchmarks conv
+        # algorithms whenever an input shape changes. The detector declares
+        # dynamic dimensions, so that search can dominate the frame budget.
+        # HEURISTIC picks a good algorithm analytically instead.
+        cuda_opts = {
+            "device_id": 0,
+            "cudnn_conv_algo_search": os.environ.get("CUDNN_ALGO", "HEURISTIC"),
+            "do_copy_in_default_stream": "1",
+            "arena_extend_strategy": "kSameAsRequested",
+        }
+        providers = [
+            ("CUDAExecutionProvider", cuda_opts),
+            "CPUExecutionProvider",
+        ]
 
         # Per-frame: detection only.
         self.analyzer = FaceAnalysis(
@@ -120,16 +134,22 @@ class FaceSwapEngine:
         )
 
         # The swap model itself.
+        # The swapper takes plain provider names.
+        swap_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         swap_path = os.path.join(model_dir, "inswapper_128.onnx")
         if not os.path.exists(swap_path) or os.path.getsize(swap_path) < MIN_MODEL_BYTES:
             self._fetch_swapper(swap_path)
         self.swapper = insightface.model_zoo.get_model(
             swap_path,
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            providers=swap_providers,
         )
 
         self._hits = 0
         self._misses = 0
+        self.t_detect = 0.0
+        self.t_swap = 0.0
+        self.n_detect = 0
+        self.n_swap = 0
         self.provider = self._active_provider()
         if self.provider == "CUDAExecutionProvider":
             logger.info("Face swap engine ready on GPU (models in %s)", model_dir)
@@ -150,6 +170,12 @@ class FaceSwapEngine:
                 + "\n Rebuild from the provided Dockerfile.\n"
                 + "=" * 62
             )
+
+    def timing_summary(self) -> str:
+        """Average ms per stage, so a slow frame can be attributed."""
+        det = (self.t_detect / self.n_detect * 1000) if self.n_detect else 0
+        swp = (self.t_swap / self.n_swap * 1000) if self.n_swap else 0
+        return f"detect {det:.0f}ms/call, swap {swp:.0f}ms/frame"
 
     @staticmethod
     def _active_provider() -> str:
@@ -241,10 +267,15 @@ class FaceSwapEngine:
         periodically — a swap that silently does nothing is the single most
         confusing failure mode here, so it should never be silent.
         """
+        import time
+
         self._frame_no += 1
         # Re-detect on the interval; reuse the previous landmarks otherwise.
         if self._frame_no % self.detect_every == 1 or not self._cached_targets:
+            t0 = time.perf_counter()
             targets = self.analyzer.get(frame_bgr)
+            self.t_detect += time.perf_counter() - t0
+            self.n_detect += 1
             if targets:
                 self._cached_targets = targets
         else:
@@ -262,9 +293,12 @@ class FaceSwapEngine:
             return frame_bgr
 
         out = frame_bgr
+        t0 = time.perf_counter()
         for target in targets:
             # `paste_back=True` blends the swapped face back into the frame.
             out = self.swapper.get(out, target, source, paste_back=True)
+        self.t_swap += time.perf_counter() - t0
+        self.n_swap += 1
 
         self._hits += 1
         if self._hits == 1:
