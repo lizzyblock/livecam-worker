@@ -198,8 +198,15 @@ class SessionAgent:
         publication: rtc.TrackPublication,
         participant: rtc.RemoteParticipant,
     ) -> None:
+        logger.info(
+            "track_subscribed: kind=%s name=%r from=%s",
+            track.kind,
+            publication.name,
+            participant.identity,
+        )
         # Never consume our own output.
         if publication.name in (PROCESSED_VIDEO, PROCESSED_AUDIO):
+            logger.debug("Ignoring our own %s", publication.name)
             return
         if track.kind == rtc.TrackKind.KIND_VIDEO:
             logger.info(
@@ -235,17 +242,14 @@ class SessionAgent:
                 source = self.source
             style = self.style_fn
 
-            if source is not None:
-                try:
-                    bgr = self.engine.swap_frame(bgr, source)
-                except Exception as e:
-                    logger.debug("swap error: %s", e)
-
-            if style is not None:
-                try:
-                    bgr = style(bgr)
-                except Exception as e:
-                    logger.debug("style error: %s", e)
+            # Both of these are synchronous and take tens of milliseconds.
+            # Run on the event loop and they block *everything* — track
+            # subscription, publishing, control messages — for the duration
+            # of every frame. Off-thread they don't.
+            try:
+                bgr = await asyncio.to_thread(self._transform, bgr, source, style)
+            except Exception as e:
+                logger.debug("transform error: %s", e)
 
             frames += 1
             if frames == 1:
@@ -258,6 +262,20 @@ class SessionAgent:
                     self._out_h,
                 )
             self._publish_video(bgr)
+
+    def _transform(self, bgr: np.ndarray, source, style) -> np.ndarray:
+        """Swap then grade. Runs in a worker thread, never on the loop."""
+        if source is not None:
+            try:
+                bgr = self.engine.swap_frame(bgr, source)
+            except Exception as e:
+                logger.debug("swap error: %s", e)
+        if style is not None:
+            try:
+                bgr = style(bgr)
+            except Exception as e:
+                logger.debug("style error: %s", e)
+        return bgr
 
     async def _process_audio(self, stream: rtc.AudioStream) -> None:
         """Mic in -> phrase chunks -> speech-to-speech -> output queue.

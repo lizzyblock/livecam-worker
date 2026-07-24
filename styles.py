@@ -29,10 +29,16 @@ import numpy as np
 
 logger = logging.getLogger("styles")
 
-ANIMEGAN_URL = (
-    "https://github.com/TachibanaYoshino/AnimeGANv3/raw/main/deploy/"
-    "AnimeGANv3_Hayao_36.onnx"
-)
+# Community mirrors, tried in order. Like the swap model, these move and
+# disappear — the style degrades to a pass-through rather than taking the
+# stream down, and the file can always be placed in MODEL_DIR by hand.
+ANIMEGAN_MIRRORS = [
+    "https://huggingface.co/spaces/Xenova/AnimeGANv3/resolve/main/AnimeGANv3_Hayao_36.onnx",
+    "https://huggingface.co/vumichien/AnimeGANv3/resolve/main/AnimeGANv3_Hayao_36.onnx",
+    "https://github.com/TachibanaYoshino/AnimeGANv3/releases/download/v1.1.0/AnimeGANv3_Hayao_36.onnx",
+]
+
+MIN_STYLE_BYTES = 1024 * 1024  # a 404 page is a few KB; the model is several MB
 
 
 # ─────────────────────────────────────────────────────────────
@@ -103,18 +109,13 @@ class AnimeStyle:
         try:
             import onnxruntime as ort
 
-            if not os.path.exists(self.path):
-                logger.info("Downloading AnimeGANv3 weights …")
-                import httpx
-
-                os.makedirs(self.model_dir, exist_ok=True)
-                with httpx.stream(
-                    "GET", ANIMEGAN_URL, follow_redirects=True, timeout=180
-                ) as r:
-                    r.raise_for_status()
-                    with open(self.path, "wb") as f:
-                        for chunk in r.iter_bytes():
-                            f.write(chunk)
+            if (
+                not os.path.exists(self.path)
+                or os.path.getsize(self.path) < MIN_STYLE_BYTES
+            ):
+                if not self._fetch(self.path):
+                    self._failed = True
+                    return False
 
             self.session = ort.InferenceSession(
                 self.path,
@@ -128,6 +129,37 @@ class AnimeStyle:
             logger.warning("Anime style unavailable, passing through: %s", e)
             self._failed = True
             return False
+
+    def _fetch(self, dest: str) -> bool:
+        """Try each mirror; returns False if none yield a usable model."""
+        import httpx
+
+        os.makedirs(self.model_dir, exist_ok=True)
+        for url in ANIMEGAN_MIRRORS:
+            try:
+                logger.info("Fetching AnimeGANv3 from %s", url.split("/")[2])
+                with httpx.stream("GET", url, follow_redirects=True, timeout=180) as r:
+                    r.raise_for_status()
+                    with open(dest, "wb") as f:
+                        for chunk in r.iter_bytes():
+                            f.write(chunk)
+                if os.path.getsize(dest) < MIN_STYLE_BYTES:
+                    os.remove(dest)
+                    logger.warning("Mirror returned a stub, trying next")
+                    continue
+                return True
+            except Exception as e:
+                logger.warning("AnimeGAN mirror failed: %s", e)
+                if os.path.exists(dest):
+                    os.remove(dest)
+
+        logger.error(
+            "Anime style unavailable — no mirror served the weights. "
+            "Place AnimeGANv3_Hayao_36.onnx at %s to enable it. "
+            "The other looks are unaffected.",
+            dest,
+        )
+        return False
 
     def __call__(self, frame: np.ndarray) -> np.ndarray:
         if not self._ensure():
@@ -181,4 +213,14 @@ class StyleBank:
         return fn
 
     def available(self) -> list[str]:
-        return sorted(self._map.keys())
+        """Looks that will actually do something.
+
+        Anime is listed only when its weights are on disk — advertising a
+        preset that silently passes through is worse than not offering it.
+        """
+        names = [k for k in self._map if k != "anime"]
+        if os.path.exists(self._anime.path) and (
+            os.path.getsize(self._anime.path) >= MIN_STYLE_BYTES
+        ):
+            names.append("anime")
+        return sorted(names)
