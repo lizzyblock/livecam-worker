@@ -11,6 +11,13 @@ active session count (Runpod/Modal both support this).
 
 from __future__ import annotations
 
+# MUST precede every other import. numpy, cv2 and onnxruntime read their
+# thread-count environment variables once, at import time — capping them
+# afterwards has no effect.
+import cpu_limits
+
+CPU_LIMIT = cpu_limits.apply()
+
 import asyncio
 import logging
 import time
@@ -76,6 +83,7 @@ async def _idle_watchdog() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global engine, styles
+    cpu_limits.apply_runtime_limits(CPU_LIMIT)
     logger.info("Loading face swap engine …")
     engine = FaceSwapEngine(config.MODEL_DIR)
     styles = StyleBank(config.MODEL_DIR)

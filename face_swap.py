@@ -90,6 +90,27 @@ class FaceSwapEngine:
 
         det = det_size or int(os.environ.get("DET_SIZE", "320"))
 
+        # ONNX Runtime sizes its intra-op pool from the host's cores too.
+        # Left alone it spawns far more threads than the cgroup allows and
+        # they spend their time contending rather than computing.
+        threads = int(os.environ.get("OMP_NUM_THREADS", "4"))
+        try:
+            import onnxruntime as ort
+
+            so = ort.SessionOptions()
+            so.intra_op_num_threads = threads
+            so.inter_op_num_threads = 1
+            so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            self.session_options = so
+        except Exception:
+            self.session_options = None
+
+        try:
+            cv2.setNumThreads(threads)
+        except Exception:
+            pass
+        logger.info("Inference thread pools capped at %d", threads)
+
         # EXHAUSTIVE is onnxruntime's default and it re-benchmarks conv
         # algorithms whenever an input shape changes. The detector declares
         # dynamic dimensions, so that search can dominate the frame budget.
