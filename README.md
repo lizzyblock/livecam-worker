@@ -214,7 +214,19 @@ The per-frame budget, roughly, on an L4:
 | Swap | ~12ms | ~12ms |
 | Colour + resize | ~4ms | ~4ms |
 
-Three changes did the work:
+**The dominant cost was not the model.** Measured on an L4 at 720p:
+
+```
+201ms/frame (transform 195, decode 1, encode 5) | detect 6ms, swap 193ms
+```
+
+InsightFace's `paste_back` composites across the whole frame — three
+warpAffine passes, a wide Gaussian blur and a float32 multiply-add, all on
+CPU. The 128x128 network it's blending is trivial by comparison. Doing that
+work on a crop around the face instead (`BLEND_CROP_SCALE`, default 2.0)
+removes most of it, since a face covers a small fraction of the picture.
+
+Four changes did the work:
 
 1. **Detection-only analyser per frame.** The swapper needs `target_face.kps`
    and nothing else. Landmarks, gender/age and recognition were roughly two
@@ -225,6 +237,7 @@ Three changes did the work:
    the pixels, and a webcam headshot has detail to spare.
 3. **Detection every Nth frame.** `DETECT_EVERY=3`. Faces move very little in
    50ms, so landmarks are reused between detections.
+4. **Crop-scoped blending.** The single biggest win — see above.
 
 **Frame dropping.** Frames arriving while one is still being processed are
 discarded rather than queued. Queuing makes latency grow without bound — each
