@@ -18,7 +18,6 @@ Design notes for real-time use:
 
 from __future__ import annotations
 
-import copy
 import logging
 import os
 from dataclasses import dataclass
@@ -224,28 +223,40 @@ class FaceSwapEngine:
 
         crop = frame[cy1:cy2, cx1:cx2]
 
-        # Re-express the face's geometry in crop coordinates. deepcopy keeps
-        # whatever class InsightFace used rather than assuming a constructor
-        # signature, and the arrays involved are tiny.
+        # Re-express the face's geometry in crop coordinates.
+        #
+        # Copying the Face is not an option: InsightFace's Face.__getattr__
+        # returns None for any missing key instead of raising AttributeError,
+        # so copy.deepcopy asks for __deepcopy__, receives None, and tries to
+        # call it. Shifting in place and restoring afterwards sidesteps the
+        # whole problem — and all GPU work runs on one dedicated thread, so
+        # there's no window for another frame to observe the shifted values.
+        origin = np.array([cx1, cy1], dtype=np.float32)
+        orig_kps = target.kps
+        orig_bbox = target.bbox
         try:
-            shifted = copy.deepcopy(target)
-            shifted.kps = target.kps - np.array([cx1, cy1], dtype=np.float32)
-            shifted.bbox = target.bbox - np.array(
+            target.kps = orig_kps - origin
+            target.bbox = orig_bbox - np.array(
                 [cx1, cy1, cx1, cy1], dtype=np.float32
             )
+            swapped = self.swapper.get(crop, target, source, paste_back=True)
         except Exception as e:
-            # Falling back silently would leave the slow path running while
-            # the logs claim the optimisation is active — say so, once.
             if not self._crop_fallback_logged:
                 self._crop_fallback_logged = True
                 logger.error(
-                    "Crop-scoped blending unavailable (%s) — falling back to "
-                    "full-frame compositing, which costs ~10x more per frame.",
+                    "Crop-scoped blending failed (%s) — using full-frame "
+                    "compositing, which costs ~10x more per frame.",
                     e,
                 )
+            target.kps = orig_kps
+            target.bbox = orig_bbox
             return self.swapper.get(frame, target, source, paste_back=True)
+        finally:
+            # Restore before anything else sees them — these targets are
+            # cached and reused across frames.
+            target.kps = orig_kps
+            target.bbox = orig_bbox
 
-        swapped = self.swapper.get(crop, shifted, source, paste_back=True)
         frame[cy1:cy2, cx1:cx2] = swapped
         return frame
 
