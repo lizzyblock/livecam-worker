@@ -97,6 +97,15 @@ MODEL_DIR = os.environ.get("MODEL_DIR", "/models")
 PORT = int(os.environ.get("PORT", "8080"))
 TARGET_FPS = int(os.environ.get("TARGET_FPS", "24"))
 
+# Latency tuning. Detection dominates the per-frame cost, so these two do
+# most of the work:
+#   DET_SIZE      detector input square. 320 is ample for a webcam headshot;
+#                 640 costs ~4x the pixels for detail nobody sees.
+#   DETECT_EVERY  run detection every Nth frame and reuse landmarks between.
+#                 Faces move little in 50ms; 3 is a good balance, 1 disables.
+DET_SIZE = int(os.environ.get("DET_SIZE", "320"))
+DETECT_EVERY = int(os.environ.get("DETECT_EVERY", "3"))
+
 # Self-shutdown safety net. If the worker sits with zero sessions for this
 # long it stops its own Runpod pod, so a missed /stop call from the API can
 # never leave a GPU billing overnight. Set IDLE_SHUTDOWN_SECONDS=0 to disable.

@@ -203,6 +203,50 @@ docker run --gpus all -p 8080:8080 -v livecam-models:/models --env-file .env liv
 Runpod and Modal both autoscale on a queue/HTTP signal — key the scaler on
 `/healthz`'s `activeSessions`.
 
+## Tuning latency
+
+The per-frame budget, roughly, on an L4:
+
+| Step | Before | After |
+|---|---|---|
+| Face analysis | ~45ms (5 models @640) | ~8ms (detection only @320) |
+| Detection interval | every frame | every 3rd |
+| Swap | ~12ms | ~12ms |
+| Colour + resize | ~4ms | ~4ms |
+
+Three changes did the work:
+
+1. **Detection-only analyser per frame.** The swapper needs `target_face.kps`
+   and nothing else. Landmarks, gender/age and recognition were roughly two
+   thirds of the cost and were being computed 20+ times a second for nothing.
+   A second, full analyser still runs once per session on the reference
+   portrait, where quality matters and speed doesn't.
+2. **Smaller detector input.** `DET_SIZE=320` rather than 640 — a quarter of
+   the pixels, and a webcam headshot has detail to spare.
+3. **Detection every Nth frame.** `DETECT_EVERY=3`. Faces move very little in
+   50ms, so landmarks are reused between detections.
+
+**Frame dropping.** Frames arriving while one is still being processed are
+discarded rather than queued. Queuing makes latency grow without bound — each
+late frame pushes the next further behind — whereas dropping keeps the output
+pinned to the present and only costs frame rate.
+
+Throughput is logged every 200 frames:
+
+```
+livecam-abc: 24ms/frame avg, ~42 fps capacity, 118 dropped
+```
+
+If average cost exceeds your frame interval you're GPU-bound: raise
+`DETECT_EVERY`, lower `DET_SIZE`, or lower `TARGET_FPS`.
+
+### If it still feels laggy
+
+Processing time is only part of it. A round trip is camera → LiveKit →
+worker → LiveKit → browser, so network adds its own delay. Check that your
+LiveKit region is near you — a European LiveKit with a US pod adds real
+milliseconds regardless of how fast the GPU is.
+
 ## Latency & quality knobs
 
 - `TARGET_FPS` (default 24) — the worker throttles processing to this; lower

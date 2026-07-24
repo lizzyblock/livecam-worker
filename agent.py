@@ -239,16 +239,31 @@ class SessionAgent:
             )
 
     async def _process_video(self, stream: rtc.VideoStream) -> None:
+        """Transform frames, dropping any we can't keep up with.
+
+        Latency here is cumulative: if a frame takes longer to process than
+        the gap between arrivals, waiting for it pushes every later frame
+        further behind and the delay grows without bound. Skipping while busy
+        keeps the output pinned to the present at the cost of frame rate,
+        which is the right trade for a live camera.
+        """
         frame_interval = 1.0 / max(1, config.TARGET_FPS)
         last = 0.0
         frames = 0
+        busy = False
+        dropped = 0
+        cost_total = 0.0
+
         async for event in stream:
             if self._closing:
                 return
+
             now = asyncio.get_event_loop().time()
-            if now - last < frame_interval:
+            if busy or now - last < frame_interval:
+                dropped += 1
                 continue
             last = now
+            busy = True
 
             frame = event.frame
             bgr = self._to_bgr(frame)
@@ -263,10 +278,14 @@ class SessionAgent:
             # Run on the event loop and they block *everything* — track
             # subscription, publishing, control messages — for the duration
             # of every frame. Off-thread they don't.
+            started = asyncio.get_event_loop().time()
             try:
                 bgr = await asyncio.to_thread(self._transform, bgr, source, style)
             except Exception as e:
                 logger.debug("transform error: %s", e)
+            finally:
+                busy = False
+            cost_total += asyncio.get_event_loop().time() - started
 
             frames += 1
             if frames == 1:
@@ -288,6 +307,18 @@ class SessionAgent:
                         bgr.shape[0],
                     )
             self._publish_video(bgr)
+
+            # Periodic honesty about throughput: average processing cost and
+            # how many frames we're skipping to stay current.
+            if frames % 200 == 0:
+                avg_ms = (cost_total / frames) * 1000
+                logger.info(
+                    "%s: %.0fms/frame avg, ~%.0f fps capacity, %d dropped",
+                    self.room_name,
+                    avg_ms,
+                    1000 / avg_ms if avg_ms > 0 else 0,
+                    dropped,
+                )
 
     def _transform(self, bgr: np.ndarray, source, style) -> np.ndarray:
         """Swap then grade. Runs in a worker thread, never on the loop.

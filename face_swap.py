@@ -66,9 +66,20 @@ class SwapSource:
 
 
 class FaceSwapEngine:
-    """One engine per worker process; sources are per-session."""
+    """One engine per worker process; sources are per-session.
 
-    def __init__(self, model_dir: str, det_size: int = 640):
+    Two analysers, deliberately:
+
+      * `source_analyzer` runs the full pipeline, but only once per session
+        when the reference portrait is embedded. Quality matters, speed
+        doesn't.
+      * `analyzer` runs on every frame and is stripped to detection alone.
+        The swapper needs `target_face.kps` and nothing else — landmarks,
+        gender/age and recognition are pure overhead at 20+ fps, and they
+        were roughly two thirds of the per-frame cost.
+    """
+
+    def __init__(self, model_dir: str, det_size: int = 0):
         if FaceAnalysis is None:
             raise RuntimeError(
                 "insightface is not installed — run on a GPU image with "
@@ -77,13 +88,36 @@ class FaceSwapEngine:
         self.model_dir = model_dir
         os.makedirs(model_dir, exist_ok=True)
 
-        # Face detection + recognition (produces the identity embeddings).
+        det = det_size or int(os.environ.get("DET_SIZE", "320"))
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        # Per-frame: detection only.
         self.analyzer = FaceAnalysis(
             name="buffalo_l",
             root=model_dir,
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            providers=providers,
+            allowed_modules=["detection"],
         )
-        self.analyzer.prepare(ctx_id=0, det_size=(det_size, det_size))
+        self.analyzer.prepare(ctx_id=0, det_size=(det, det))
+
+        # Once per session: needs recognition for the identity embedding.
+        self.source_analyzer = FaceAnalysis(
+            name="buffalo_l",
+            root=model_dir,
+            providers=providers,
+            allowed_modules=["detection", "recognition"],
+        )
+        self.source_analyzer.prepare(ctx_id=0, det_size=(640, 640))
+
+        # Detection is the expensive step and faces barely move between
+        # frames, so it runs every Nth frame and the last known landmarks
+        # are reused in between.
+        self.detect_every = max(1, int(os.environ.get("DETECT_EVERY", "3")))
+        self._cached_targets: list = []
+        self._frame_no = 0
+        logger.info(
+            "Engine tuned: det_size=%d detect_every=%d", det, self.detect_every
+        )
 
         # The swap model itself.
         swap_path = os.path.join(model_dir, "inswapper_128.onnx")
@@ -185,7 +219,7 @@ class FaceSwapEngine:
 
     def prepare_source(self, portrait_bgr: np.ndarray, name: str) -> Optional[SwapSource]:
         """Analyze the reference portrait once → cached identity embedding."""
-        faces = self.analyzer.get(portrait_bgr)
+        faces = self.source_analyzer.get(portrait_bgr)
         if not faces:
             logger.warning("No face detected in reference portrait for %s", name)
             return None
@@ -207,8 +241,17 @@ class FaceSwapEngine:
         periodically — a swap that silently does nothing is the single most
         confusing failure mode here, so it should never be silent.
         """
-        targets = self.analyzer.get(frame_bgr)
+        self._frame_no += 1
+        # Re-detect on the interval; reuse the previous landmarks otherwise.
+        if self._frame_no % self.detect_every == 1 or not self._cached_targets:
+            targets = self.analyzer.get(frame_bgr)
+            if targets:
+                self._cached_targets = targets
+        else:
+            targets = self._cached_targets
+
         if not targets:
+            self._cached_targets = []
             self._misses += 1
             if self._misses in (30, 300) or self._misses % 900 == 0:
                 logger.warning(
