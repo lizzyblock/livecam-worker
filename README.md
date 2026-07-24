@@ -167,6 +167,29 @@ Notes on the workflow:
 To rebuild without changing code, use **Actions → Build & push worker image →
 Run workflow**.
 
+### Auto-deploy (optional, recommended)
+
+Add two repository secrets and every push deploys the worker for you —
+no dashboard visit, no copying SHAs:
+
+**Settings → Secrets and variables → Actions → New repository secret**
+
+| Secret | Value |
+|---|---|
+| `RUNPOD_API_KEY` | your Runpod API key |
+| `RUNPOD_POD_ID` | e.g. `gmblmgvki6k7il` |
+
+The workflow then points the pod at the new commit-SHA image and restarts it.
+
+**Why the SHA and not `:latest`:** Runpod caches images per host, and a
+restart will happily serve a cached `:latest` rather than pulling. A tag it
+has never seen must be fetched, so the SHA is what makes a deploy actually
+take effect. Every run prints the exact image reference in its summary if you
+ever need to set it by hand.
+
+If the secrets aren't set the deploy step is skipped and the workflow just
+builds, as before.
+
 ## Deploying
 
 Build the image and run one container per GPU (A10 is plenty for 720p at
