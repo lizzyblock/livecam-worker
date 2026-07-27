@@ -4,14 +4,15 @@ LiveCam GPU worker — LiveKit agent.
 Joins the streamer's room as a second participant and republishes two
 transformed tracks:
 
-  video -> `livecam-processed`   face swap, then the look/style grade
+  video -> `livecam-processed`   body swap (face+hair+clothes+body),
+                                  then the look/style grade
   audio -> `livecam-audio`       speech-to-speech voice conversion
 
 The streamer's browser and the desktop virtual-camera companion subscribe to
 those, and that is what reaches OBS/Zoom/Twitch.
 
 Everything is hot-swappable mid-session over LiveKit data messages, so
-changing a face, look or voice never drops the stream.
+changing a body, look or voice never drops the stream.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ import numpy as np
 from livekit import rtc
 
 import config
-from face_swap import FaceSwapEngine, SwapSource, decode_portrait
+from body_swap import BodySwapEngine, BodySwapSource, decode_portrait
 from styles import StyleBank
 from voice import FrameQueue, VoiceConverter
 
@@ -49,7 +50,7 @@ class SessionAgent:
 
     def __init__(
         self,
-        engine: FaceSwapEngine,
+        engine: BodySwapEngine,
         styles: StyleBank,
         room_name: str,
         cfg: dict,
@@ -59,16 +60,12 @@ class SessionAgent:
         self.room_name = room_name
         self.cfg = cfg
 
-        self.source: Optional[SwapSource] = None
+        self.source: Optional[BodySwapSource] = None
         self.style_fn = styles.get(cfg.get("effectPreset"))
         self.converter: Optional[VoiceConverter] = None
 
         self.room = rtc.Room()
         self._video_out: Optional[rtc.VideoSource] = None
-        # Output resolution. Every stage — conversion, swap paste-back,
-        # encode — scales with pixel count, so this is the bluntest and most
-        # effective lever when a session can't keep up. 960x540 costs about
-        # 45% less work than 720p and is hard to tell apart on a webcam feed.
         self._out_w = int(os.environ.get("OUT_WIDTH", "1280"))
         self._out_h = int(os.environ.get("OUT_HEIGHT", "720"))
         self._audio_out: Optional[rtc.AudioSource] = None
@@ -79,10 +76,6 @@ class SessionAgent:
         self._swap_errors = 0
         self._style_errors = 0
 
-        # A single dedicated thread for every GPU call. asyncio.to_thread
-        # hands work to an arbitrary pool thread, and switching the CUDA
-        # context between threads costs more than the inference itself —
-        # pinning it to one thread keeps the context warm.
         self._gpu = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
 
     # -- lifecycle -------------------------------------------------
@@ -108,10 +101,6 @@ class SessionAgent:
         await self.room.connect(config.LIVEKIT_URL, token)
         logger.info("Agent joined room %s", self.room_name)
 
-        # Declared once and never changed. Every frame we publish is resized
-        # to match: a VideoSource declared at one size receiving frames at
-        # another is interpreted with the wrong stride, which renders as
-        # rainbow smearing rather than an error.
         self._video_out = rtc.VideoSource(self._out_w, self._out_h)
         video_track = rtc.LocalVideoTrack.create_video_track(
             PROCESSED_VIDEO, self._video_out
@@ -148,19 +137,19 @@ class SessionAgent:
         if not face or not face.get("portraitUrl"):
             async with self._lock:
                 self.source = None
-            logger.info("Face swap off for %s", self.room_name)
+            logger.info("Body swap off for %s", self.room_name)
             return
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.get(face["portraitUrl"])
                 resp.raise_for_status()
             portrait = decode_portrait(resp.content)
-            prepared = self.engine.prepare_source(portrait, face.get("id", "face"))
+            prepared = self.engine.prepare_source(portrait, face.get("id", "body"))
             async with self._lock:
                 self.source = prepared
             logger.info("Loaded swap source for %s", self.room_name)
         except Exception as e:
-            logger.warning("Could not load face: %s", e)
+            logger.warning("Could not load face/body: %s", e)
             async with self._lock:
                 self.source = None
 
@@ -219,16 +208,10 @@ class SessionAgent:
             publication.name,
             participant.identity,
         )
-        # Never consume our own output.
         if publication.name in (PROCESSED_VIDEO, PROCESSED_AUDIO):
             logger.debug("Ignoring our own %s", publication.name)
             return
         if track.kind == rtc.TrackKind.KIND_VIDEO:
-            # Belt and braces on resolution. The publisher disables simulcast
-            # so there's only one full-quality layer to receive — this just
-            # covers older clients that still send several. The enum is named
-            # inconsistently across SDK versions, so try each and stay quiet
-            # if none apply.
             for attr in ("HIGH", "QUALITY_HIGH", "VIDEO_QUALITY_HIGH"):
                 quality = getattr(rtc.VideoQuality, attr, None)
                 if quality is not None:
@@ -252,14 +235,7 @@ class SessionAgent:
             )
 
     async def _process_video(self, stream: rtc.VideoStream) -> None:
-        """Transform frames, dropping any we can't keep up with.
-
-        Latency here is cumulative: if a frame takes longer to process than
-        the gap between arrivals, waiting for it pushes every later frame
-        further behind and the delay grows without bound. Skipping while busy
-        keeps the output pinned to the present at the cost of frame rate,
-        which is the right trade for a live camera.
-        """
+        """Transform frames, dropping any we can't keep up with."""
         frame_interval = 1.0 / max(1, config.TARGET_FPS)
         last = 0.0
         frames = 0
@@ -268,9 +244,6 @@ class SessionAgent:
         cost_total = 0.0
         conv_total = 0.0
         pub_total = 0.0
-        # Report on a timer rather than a frame count: at low frame rates a
-        # frame-based interval can outlast a short test session, which is
-        # exactly when the numbers are most wanted.
         report_every = 10.0
         next_report = asyncio.get_event_loop().time() + report_every
 
@@ -297,10 +270,6 @@ class SessionAgent:
                 source = self.source
             style = self.style_fn
 
-            # Both of these are synchronous and take tens of milliseconds.
-            # Run on the event loop and they block *everything* — track
-            # subscription, publishing, control messages — for the duration
-            # of every frame. Off-thread they don't.
             started = asyncio.get_event_loop().time()
             try:
                 loop = asyncio.get_event_loop()
@@ -336,8 +305,6 @@ class SessionAgent:
             self._publish_video(bgr)
             pub_total += asyncio.get_event_loop().time() - t_pub
 
-            # Periodic honesty about throughput: average processing cost and
-            # how many frames we're skipping to stay current.
             if asyncio.get_event_loop().time() >= next_report and frames:
                 next_report = asyncio.get_event_loop().time() + report_every
                 avg_ms = (cost_total / frames) * 1000
@@ -355,13 +322,7 @@ class SessionAgent:
                 )
 
     def _transform(self, bgr: np.ndarray, source, style) -> np.ndarray:
-        """Swap then grade. Runs in a worker thread, never on the loop.
-
-        Errors are reported, not swallowed. A per-frame failure logged at
-        debug level is invisible in production and presents as a swap that
-        does nothing — so the first occurrence is logged loudly and the rest
-        are throttled to keep the log readable.
-        """
+        """Body swap then grade. Runs in a worker thread, never on the loop."""
         if source is not None:
             try:
                 bgr = self.engine.swap_frame(bgr, source)
@@ -369,7 +330,7 @@ class SessionAgent:
                 self._swap_errors += 1
                 if self._swap_errors == 1 or self._swap_errors % 300 == 0:
                     logger.error(
-                        "Face swap failing (%d frames): %s",
+                        "Body swap failing (%d frames): %s",
                         self._swap_errors,
                         e,
                         exc_info=self._swap_errors == 1,
@@ -386,11 +347,7 @@ class SessionAgent:
         return bgr
 
     async def _process_audio(self, stream: rtc.AudioStream) -> None:
-        """Mic in -> phrase chunks -> speech-to-speech -> output queue.
-
-        With no voice selected the mic is copied through untouched, so the
-        published audio track is always usable.
-        """
+        """Mic in -> phrase chunks -> speech-to-speech -> output queue."""
         async for event in stream:
             if self._closing:
                 return
@@ -448,13 +405,7 @@ class SessionAgent:
 
     @staticmethod
     def _to_bgr(frame: rtc.VideoFrame) -> Optional[np.ndarray]:
-        """Convert an incoming frame to BGR as cheaply as possible.
-
-        WebRTC delivers I420. Going I420 -> RGBA -> BGR touches every pixel
-        twice and allocates a 3.7MB intermediate at 720p; converting straight
-        from I420 halves that. RGBA is kept as a fallback for any frame type
-        that won't convert.
-        """
+        """Convert an incoming frame to BGR as cheaply as possible."""
         try:
             i420 = frame.convert(rtc.VideoBufferType.I420)
             w = getattr(i420, "width", frame.width)
@@ -465,7 +416,7 @@ class SessionAgent:
                 yuv = buf[:expected].reshape(h * 3 // 2, w)
                 return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
         except Exception:
-            pass  # fall through to RGBA
+            pass
 
         rgba = frame.convert(rtc.VideoBufferType.RGBA)
         w = getattr(rgba, "width", frame.width)
