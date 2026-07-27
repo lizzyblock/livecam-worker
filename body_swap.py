@@ -51,6 +51,8 @@ except ImportError:
     _MP_AVAILABLE = False
 
 
+from face_swap import decode_portrait  # noqa: F401
+
 # ─────────────────────────────────────────────────────────────
 # Data structures
 # ─────────────────────────────────────────────────────────────
