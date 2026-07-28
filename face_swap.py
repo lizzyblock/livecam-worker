@@ -162,6 +162,16 @@ class FaceSwapEngine:
         # Unsharp strength on the swapped face. 0 disables; above ~0.8 the
         # edges start to look electric.
         self.sharpen = float(os.environ.get("FACE_SHARPEN", "0.35"))
+
+        # Optional GFPGAN face restoration. The swap model emits a soft
+        # 128x128 face; GFPGAN reconstructs realistic skin/eye/mouth detail,
+        # the single biggest available quality jump. It costs ~15-30ms/frame,
+        # affordable now that the swap itself is ~35ms and there's a 4090
+        # underneath. Off by default; FACE_RESTORE=1 enables it.
+        self.restore = os.environ.get("FACE_RESTORE", "0") == "1"
+        self._restorer = None
+        if self.restore:
+            self._init_restorer()
         self._blend_mask = self._make_blend_mask(128)
         self._cached_targets: list = []
         self._frame_no = 0
@@ -214,6 +224,70 @@ class FaceSwapEngine:
                 + "=" * 62
             )
 
+    def _init_restorer(self) -> None:
+        """Load GFPGAN once. Falls back to plain sharpening if unavailable."""
+        try:
+            import onnxruntime as ort
+
+            path = os.path.join(self.model_dir, "gfpgan_1.4.onnx")
+            if not os.path.exists(path):
+                self._fetch_gfpgan(path)
+            providers = [
+                ("CUDAExecutionProvider", {"device_id": 0}),
+                "CPUExecutionProvider",
+            ]
+            self._restorer = ort.InferenceSession(path, providers=providers)
+            self._restore_in = self._restorer.get_inputs()[0].name
+            logger.info("GFPGAN face restoration enabled")
+        except Exception as e:
+            logger.error(
+                "Could not enable face restoration (%s) — continuing with "
+                "sharpening only.",
+                e,
+            )
+            self.restore = False
+            self._restorer = None
+
+    def _fetch_gfpgan(self, dest: str) -> None:
+        import httpx
+
+        # ONNX export of GFPGAN v1.4, community-mirrored.
+        urls = [
+            "https://huggingface.co/gmk123qwe/gfpgan/resolve/main/GFPGANv1.4.onnx",
+            "https://huggingface.co/facefusion/models/resolve/main/gfpgan_1.4.onnx",
+        ]
+        for url in urls:
+            try:
+                logger.info("Fetching GFPGAN from %s", url.split("/")[2])
+                with httpx.stream("GET", url, follow_redirects=True, timeout=180) as r:
+                    r.raise_for_status()
+                    with open(dest, "wb") as f:
+                        for chunk in r.iter_bytes():
+                            f.write(chunk)
+                if os.path.getsize(dest) > 50 * 1024 * 1024:
+                    return
+                os.remove(dest)
+            except Exception as e:
+                logger.warning("GFPGAN mirror failed: %s", e)
+                if os.path.exists(dest):
+                    os.remove(dest)
+        raise RuntimeError("no GFPGAN mirror available")
+
+    def _restore_face(self, face_bgr: np.ndarray) -> np.ndarray:
+        """Run GFPGAN on an aligned face crop. Expects/returns BGR uint8."""
+        if self._restorer is None:
+            return face_bgr
+        h, w = face_bgr.shape[:2]
+        # GFPGAN wants 512x512 RGB, normalised to [-1, 1].
+        inp = cv2.resize(face_bgr, (512, 512), interpolation=cv2.INTER_LINEAR)
+        inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        inp = (inp - 0.5) / 0.5
+        inp = inp.transpose(2, 0, 1)[None]
+        out = self._restorer.run(None, {self._restore_in: inp})[0][0]
+        out = np.clip((out.transpose(1, 2, 0) * 0.5 + 0.5) * 255.0, 0, 255).astype(np.uint8)
+        out = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+        return cv2.resize(out, (w, h), interpolation=cv2.INTER_LINEAR)
+
     @staticmethod
     def _make_blend_mask(size: int) -> np.ndarray:
         """Soft elliptical mask over the aligned face, built once.
@@ -265,9 +339,19 @@ class FaceSwapEngine:
         IM_local[1, 2] -= y1
         bw, bh = x2 - x1, y2 - y1
 
-        # Cubic for the face: it's being upscaled ~3x from the model's
-        # 128px output, where linear interpolation is visibly soft. The mask
-        # is a smooth gradient, so linear is fine and cheaper there.
+        # Restore detail on the aligned face *before* warping it back, while
+        # it's still square and centred — that's what GFPGAN expects.
+        if self.restore and self._restorer is not None:
+            try:
+                face_128 = self._restore_face(face_128)
+            except Exception as e:
+                if not getattr(self, "_restore_err_logged", False):
+                    self._restore_err_logged = True
+                    logger.error("Restoration failed mid-stream: %s", e)
+
+        # Cubic for the face: it's being upscaled from the model's output,
+        # where linear interpolation is visibly soft. The mask is a smooth
+        # gradient, so linear is fine and cheaper there.
         warped_face = cv2.warpAffine(
             face_128, IM_local, (bw, bh), flags=cv2.INTER_CUBIC, borderValue=0
         )
