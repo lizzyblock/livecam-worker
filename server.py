@@ -4,10 +4,16 @@ Dispatch API for the LiveCam GPU worker.
 The NestJS API calls POST /dispatch when a streamer starts a LiveCam session.
 This process mints a worker-identity token for that room, spins up a
 SessionAgent, and tracks it so it can be cleaned up when the room ends.
+
+Run one of these per GPU instance; put them behind an autoscaler keyed on
+active session count (Runpod/Modal both support this).
 """
 
 from __future__ import annotations
 
+# MUST precede every other import. numpy, cv2 and onnxruntime read their
+# thread-count environment variables once, at import time — capping them
+# afterwards has no effect.
 import cpu_limits
 
 CPU_LIMIT = cpu_limits.apply()
@@ -24,24 +30,26 @@ from pydantic import BaseModel
 
 import config
 from agent import SessionAgent
-from body_swap import BodySwapEngine
+from face_swap import FaceSwapEngine
 from styles import StyleBank
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("server")
 
-engine: BodySwapEngine | None = None
+engine: FaceSwapEngine | None = None
 styles: StyleBank | None = None
 sessions: dict[str, SessionAgent] = {}
 last_active: float = time.time()
 
 
 def touch() -> None:
+    """Mark the worker as recently used."""
     global last_active
     last_active = time.time()
 
 
 async def _self_shutdown() -> None:
+    """Stop our own Runpod pod so GPU billing halts."""
     if not (config.RUNPOD_API_KEY and config.RUNPOD_POD_ID):
         logger.warning("Idle, but no Runpod credentials — staying up")
         return
@@ -54,6 +62,12 @@ async def _self_shutdown() -> None:
 
 
 async def _idle_watchdog() -> None:
+    """Safety net: shut down if nothing has used the worker for a while.
+
+    The API normally stops the pod itself when the last session ends. This
+    catches the case where that call never lands (API restart, network blip)
+    so an idle GPU can't quietly bill all night.
+    """
     if config.IDLE_SHUTDOWN_SECONDS <= 0:
         return
     while True:
@@ -70,8 +84,8 @@ async def _idle_watchdog() -> None:
 async def lifespan(_: FastAPI):
     global engine, styles
     cpu_limits.apply_runtime_limits(CPU_LIMIT)
-    logger.info("Loading body swap engine …")
-    engine = BodySwapEngine(config.MODEL_DIR)
+    logger.info("Loading face swap engine …")
+    engine = FaceSwapEngine(config.MODEL_DIR)
     styles = StyleBank(config.MODEL_DIR)
     touch()
     watchdog = asyncio.create_task(_idle_watchdog())
@@ -102,6 +116,14 @@ class DispatchBody(BaseModel):
 
 
 def _worker_token(room: str) -> str:
+    """Token for the worker to join the room, publish, and subscribe.
+
+    NOTE: `hidden` must stay off. A hidden participant is invisible to the
+    others *along with its tracks* — the transformed video would be published
+    into a room where nobody can subscribe to it. The streamer seeing a
+    "LiveCam" participant in the list is a small cosmetic cost for output
+    that actually reaches them.
+    """
     grant = api.VideoGrants(
         room=room,
         room_join=True,
@@ -120,8 +142,9 @@ def _worker_token(room: str) -> str:
 
 @app.get("/")
 async def root():
+    """Friendly landing so hitting the bare host isn't a bare 404."""
     return {
-        "service": "LiveCam GPU worker (body swap)",
+        "service": "LiveCam GPU worker",
         "ready": engine is not None,
         "endpoints": {
             "health": "/healthz",
@@ -137,13 +160,8 @@ async def healthz():
         "status": "ok",
         "activeSessions": len(sessions),
         "engine": engine is not None,
-        "mode": "body_swap",
-        "provider": getattr(engine, "face_engine", None)
-        and getattr(engine.face_engine, "provider", None),
-        "gpu": (
-            getattr(engine, "face_engine", None)
-            and getattr(engine.face_engine, "provider", "") == "CUDAExecutionProvider"
-        ),
+        "provider": getattr(engine, "provider", None),
+        "gpu": getattr(engine, "provider", "") == "CUDAExecutionProvider",
         "styles": styles.available() if styles else [],
         "idleSeconds": int(time.time() - last_active) if not sessions else 0,
     }
@@ -175,13 +193,24 @@ async def stop(body: DispatchBody):
     agent = sessions.pop(body.room, None)
     if agent:
         await agent.stop()
-    touch()
+    touch()  # start the idle clock from now
     return {"status": "stopped", "room": body.room}
 
 
 async def _watch(room: str, agent: SessionAgent) -> None:
+    """Reap the session once the streamer has left.
+
+    Two rules keep this from cutting a session short:
+
+    1. A join grace period. The API dispatches us *before* it hands the
+       browser its token, so we are always in the room first. Reaping on an
+       empty room immediately would kill every session before it starts.
+    2. Only reap after someone has actually been seen. A room that never had
+       a participant is one where the streamer is still connecting — not one
+       they have left.
+    """
     join_grace_seconds = 90
-    empty_checks_before_reap = 3
+    empty_checks_before_reap = 3  # ~45s of confirmed emptiness
     waited = 0
     seen_participant = False
     empty_streak = 0
