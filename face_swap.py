@@ -274,19 +274,22 @@ class FaceSwapEngine:
         raise RuntimeError("no GFPGAN mirror available")
 
     def _restore_face(self, face_bgr: np.ndarray) -> np.ndarray:
-        """Run GFPGAN on an aligned face crop. Expects/returns BGR uint8."""
+        """Run GFPGAN on an aligned face crop → crisp 512x512 BGR.
+
+        Returns the full 512px result, NOT resized back down. Shrinking it to
+        the swap model's 128px would throw away exactly the detail GFPGAN just
+        reconstructed — the restored face has to be warped to the frame at
+        full resolution to be worth running at all.
+        """
         if self._restorer is None:
             return face_bgr
-        h, w = face_bgr.shape[:2]
-        # GFPGAN wants 512x512 RGB, normalised to [-1, 1].
         inp = cv2.resize(face_bgr, (512, 512), interpolation=cv2.INTER_LINEAR)
         inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         inp = (inp - 0.5) / 0.5
         inp = inp.transpose(2, 0, 1)[None]
         out = self._restorer.run(None, {self._restore_in: inp})[0][0]
         out = np.clip((out.transpose(1, 2, 0) * 0.5 + 0.5) * 255.0, 0, 255).astype(np.uint8)
-        out = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
-        return cv2.resize(out, (w, h), interpolation=cv2.INTER_LINEAR)
+        return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)  # 512x512
 
     @staticmethod
     def _make_blend_mask(size: int) -> np.ndarray:
@@ -340,20 +343,41 @@ class FaceSwapEngine:
         bw, bh = x2 - x1, y2 - y1
 
         # Restore detail on the aligned face *before* warping it back, while
-        # it's still square and centred — that's what GFPGAN expects.
+        # it's still square and centred — that's what GFPGAN expects. This
+        # returns a 512x512 face; the source coordinate system is 128, so the
+        # transform is scaled up 4x to sample from the high-res result rather
+        # than the soft original.
+        face_src = face_128
+        src_size = 128
         if self.restore and self._restorer is not None:
             try:
-                face_128 = self._restore_face(face_128)
+                face_src = self._restore_face(face_128)  # 512x512
+                src_size = face_src.shape[0]
             except Exception as e:
                 if not getattr(self, "_restore_err_logged", False):
                     self._restore_err_logged = True
                     logger.error("Restoration failed mid-stream: %s", e)
 
-        # Cubic for the face: it's being upscaled from the model's output,
-        # where linear interpolation is visibly soft. The mask is a smooth
-        # gradient, so linear is fine and cheaper there.
+        # Rebuild the warp to sample from the higher-res source.
+        #
+        # IM_local maps the 128px aligned face → destination box. The restored
+        # face is `src_size` px (512), so a source pixel there corresponds to
+        # (128/src_size) in the original space. Compose IM_local with that
+        # scale-down: dst = IM_local · Sdown · [src_px; 1]. This is proper
+        # matrix composition — scaling IM_local's columns directly does NOT
+        # place the face correctly (verified numerically).
+        if src_size != 128:
+            IM3 = np.vstack([IM_local, [0, 0, 1]]).astype(np.float32)
+            k = 128.0 / src_size
+            Sdown = np.array([[k, 0, 0], [0, k, 0], [0, 0, 1]], dtype=np.float32)
+            IM_use = (IM3 @ Sdown)[:2].astype(np.float32)
+        else:
+            IM_use = IM_local
+
+        # Cubic sampling — with restoration the source is sharp, so this
+        # preserves detail rather than inventing it.
         warped_face = cv2.warpAffine(
-            face_128, IM_local, (bw, bh), flags=cv2.INTER_CUBIC, borderValue=0
+            face_src, IM_use, (bw, bh), flags=cv2.INTER_CUBIC, borderValue=0
         )
         warped_mask = cv2.warpAffine(
             self._blend_mask, IM_local, (bw, bh), flags=cv2.INTER_LINEAR, borderValue=0
