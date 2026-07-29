@@ -65,6 +65,8 @@ class HairOverlay:
         # "use the measured size", y_offset=0.0 means "use the measured height".
         self.y_offset = float(os.environ.get("HAIR_Y_OFFSET", "0.0"))
         self.scale_k = float(os.environ.get("HAIR_SCALE", "1.0"))
+        # Debug: draw anchor points and the asset box so placement is visible.
+        self.debug = os.environ.get("HAIR_DEBUG", "0") == "1"
 
         self._mesh = None
         self._asset_bgr: Optional[np.ndarray] = None
@@ -166,6 +168,16 @@ class HairOverlay:
 
         hair_w = xs.max() - xs.min()
         hair_cx = (xs.min() + xs.max()) / 2.0
+        # Store the hair's actual pixel bounds within the asset — placement
+        # must anchor by where the hair *is*, not the image edges.
+        self._hair_bounds = {
+            "top": int(ys.min()),
+            "bottom": int(ys.max()),
+            "left": int(xs.min()),
+            "right": int(xs.max()),
+            "w": int(hair_w),
+            "cx": float(hair_cx),
+        }
 
         face_w_ratio = None
         anchor_y = None
@@ -289,7 +301,14 @@ class HairOverlay:
             anchors = self._anchors(bgr)
             if anchors is None:
                 return bgr
-            return self._place(bgr, anchors)
+            out = self._place(bgr, anchors)
+            if self.debug:
+                cx, cy, width, roll = anchors
+                cv2.circle(out, (int(cx), int(cy)), 6, (0, 0, 255), -1)  # asset center = red
+                cv2.putText(out, f"w={int(width)} roll={roll:.0f}",
+                            (int(cx) - 60, int(cy) - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            return out
         except Exception as e:
             logger.debug("hair apply error: %s", e)
             return bgr
@@ -355,23 +374,43 @@ class HairOverlay:
         # Alpha-based fallback (hair-only asset, no face detected).
         #
         # A pure-hair PNG fills most of its frame, so a centre-of-mass anchor
-        # lands the hair over the face. Anchor by the HEAD instead: the hair's
-        # lower edge sits around the forehead/hairline and the volume rises
-        # over the crown from there, so it never covers the face.
-        width = user_face_w * 1.9 * self.scale_k
-        render_scale = width / aw
-        H = ah * render_scale  # rendered asset height
+        # lands the hair over the face. Anchor by the HEAD instead.
 
-        # Anchor the asset's BOTTOM edge to the forehead so the whole hair mass
-        # sits above the face. The bottom is allowed to come down slightly onto
-        # the forehead (overlap) so there's no gap at the hairline.
+        # Alpha-based fallback (hair-only asset, no face detected).
         #
-        # In up-coordinates the bottom edge is at (center - up*H/2) [toward the
-        # chin]. We want that at the forehead minus a small overlap toward the
-        # face. Solving: center = fore + up*(H/2 - overlap).
-        overlap = face_h * (0.22 - self.y_offset)  # slider nudges hairline
-        center = fore + up * (H / 2.0 - overlap)
-        return float(center[0]), float(center[1]), float(width), float(roll)
+        # Anchor by the hair's ACTUAL pixel bounds inside the asset, not the
+        # image edges — the hair's bottom row is the hairline, and it must sit
+        # at the user's forehead with the volume rising over the scalp.
+        hb = getattr(self, "_hair_bounds", None)
+        if hb is None:
+            hb = {"top": 0, "bottom": ah, "w": aw, "cx": aw / 2.0}
+
+        # Scale so the hair's on-screen width covers the head (~1.6x face).
+        target_head_w = user_face_w * 1.6 * self.scale_k
+        render_scale = target_head_w / max(1, hb["w"])
+        H = ah * render_scale
+        W = aw * render_scale
+
+        # Where the hair's bottom (hairline) should land: forehead + a little
+        # overlap onto it (nudgeable via y_offset).
+        overlap = face_h * (0.15 - self.y_offset)
+        # In the asset, the hairline is at row hb["bottom"]; from the asset top
+        # that's hb["bottom"]*render_scale px down.
+        hair_bottom_from_top = hb["bottom"] * render_scale
+        # Place the asset so that row lands at (forehead + overlap), measured
+        # along the head's down-axis (-up). Also centre horizontally on the
+        # hair's own centre, not the image centre.
+        # Asset-top point in frame:
+        top_point = fore + up * (hair_bottom_from_top - overlap)
+        # Asset centre is H/2 further down from the top (toward chin = -up):
+        center = top_point - up * (H / 2.0)
+
+        # Horizontal: shift so the hair's centre column sits on the face x.
+        hair_cx_off = (hb["cx"] - aw / 2.0) * render_scale
+        # Perpendicular (roll-aware) x correction is minor; apply along x.
+        center = center - np.array([hair_cx_off, 0.0], dtype=np.float32)
+
+        return float(center[0]), float(center[1]), float(W), float(roll)
 
     def _place(self, frame, anchors):
         cx, cy, width, roll = anchors
