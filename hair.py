@@ -352,13 +352,25 @@ class HairOverlay:
             center = center + up * (face_h * self.y_offset)
             return float(center[0]), float(center[1]), float(width), float(roll)
 
-        # Alpha-based fallback: infer head width from hair, anchor at CoM.
-        anchor_y = fit["anchor_y"] if fit else 0.4
-        width = user_face_w * 1.7 * self.scale_k
+        # Alpha-based fallback (hair-only asset, no face detected).
+        #
+        # A pure-hair PNG fills most of its frame, so a centre-of-mass anchor
+        # lands the hair over the face. Anchor by the HEAD instead: the hair's
+        # lower edge sits around the forehead/hairline and the volume rises
+        # over the crown from there, so it never covers the face.
+        width = user_face_w * 1.9 * self.scale_k
         render_scale = width / aw
-        H = ah * render_scale
-        center = face_center - up * (H * (0.5 - anchor_y))
-        center = center + up * (face_h * self.y_offset)
+        H = ah * render_scale  # rendered asset height
+
+        # Anchor the asset's BOTTOM edge to the forehead so the whole hair mass
+        # sits above the face. The bottom is allowed to come down slightly onto
+        # the forehead (overlap) so there's no gap at the hairline.
+        #
+        # In up-coordinates the bottom edge is at (center - up*H/2) [toward the
+        # chin]. We want that at the forehead minus a small overlap toward the
+        # face. Solving: center = fore + up*(H/2 - overlap).
+        overlap = face_h * (0.22 - self.y_offset)  # slider nudges hairline
+        center = fore + up * (H / 2.0 - overlap)
         return float(center[0]), float(center[1]), float(width), float(roll)
 
     def _place(self, frame, anchors):
