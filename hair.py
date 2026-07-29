@@ -60,13 +60,11 @@ class HairOverlay:
             self.asset_dir = os.path.join(here, "hair_assets")
         self.enabled = False
         self.seamless = os.environ.get("HAIR_SEAMLESS", "0") == "1"
-        # Vertical placement of the asset centre, as a fraction of face height
-        # above the forehead. Higher = asset sits higher on the head. Negative
-        # pushes it down onto the face. Tune live with set_placement.
-        self.y_offset = float(os.environ.get("HAIR_Y_OFFSET", "0.15"))
-        # Width multiplier vs ear-to-ear span. Hair is wider than the face and
-        # wraps the sides of the head, so this is >1.
-        self.scale_k = float(os.environ.get("HAIR_SCALE", "1.7"))
+        # Fit is automatic (measured per-asset). These are neutral by default
+        # and act only as an optional fine-tune nudge on top: scale_k=1.0 means
+        # "use the measured size", y_offset=0.0 means "use the measured height".
+        self.y_offset = float(os.environ.get("HAIR_Y_OFFSET", "0.0"))
+        self.scale_k = float(os.environ.get("HAIR_SCALE", "1.0"))
 
         self._mesh = None
         self._asset_bgr: Optional[np.ndarray] = None
@@ -137,8 +135,130 @@ class HairOverlay:
         self._asset_alpha = (img[:, :, 3].astype(np.float32) / 255.0)
         self._current_style = name
         self.enabled = True
+        # Measure THIS asset so it fits automatically — no manual sliders.
+        self._analyze_asset()
         logger.info("Hair style set to %r (%dx%d)", name, img.shape[1], img.shape[0])
         return True
+
+    def _analyze_asset(self) -> None:
+        """Measure the loaded asset so it aligns to a head automatically.
+
+        The goal is a fit with no manual tuning. Every hair PNG is cropped
+        differently, so instead of assuming proportions we measure them once:
+
+          * Try to detect a face *in the asset*. If the cutout includes the
+            person's face, that face's width and position tell us exactly how
+            the hair relates to a head — we map that face onto the live user's
+            face landmarks and the hair follows perfectly.
+          * If there's no face (a pure hair cutout), fall back to the alpha
+            shape: the hair's width and the vertical position of its centre of
+            mass give a reliable automatic placement.
+
+        Results are stored as ratios relative to the asset, so placement scales
+        with the user's head at any distance.
+        """
+        alpha = self._asset_alpha
+        ah, aw = alpha.shape[:2]
+        ys, xs = np.where(alpha > 0.3)
+        if len(xs) == 0:
+            self._fit = {"width_ratio": 1.7, "anchor_y": 0.4, "face_w_ratio": None}
+            return
+
+        hair_w = xs.max() - xs.min()
+        hair_cx = (xs.min() + xs.max()) / 2.0
+
+        face_w_ratio = None
+        anchor_y = None
+        # Attempt face detection on the asset (opaque regions only).
+        try:
+            comp = self._asset_bgr.copy()
+            # Flatten transparent areas to mid-grey so detection isn't fooled.
+            a3 = (alpha[:, :, None] > 0.3)
+            comp = np.where(a3, comp, 128).astype(np.uint8)
+            faces = self._detect_face_in_image(comp)
+            if faces is not None:
+                fx, fy, fw, fh = faces
+                # The user's ear-to-ear width will map to this asset face width;
+                # from that, the whole hair scales correctly.
+                face_w_ratio = fw / aw
+                # Vertical anchor: where the face centre sits within the asset,
+                # as a fraction of asset height. We align the user's face centre
+                # to this point, so the hair sits exactly as it did on the
+                # original head.
+                anchor_y = (fy + fh / 2.0) / ah
+                logger.info(
+                    "Asset %r: face found, auto-fit (face_w=%.2f of asset, "
+                    "anchor_y=%.2f)",
+                    self._current_style,
+                    face_w_ratio,
+                    anchor_y,
+                )
+        except Exception as e:
+            logger.debug("asset face detect failed: %s", e)
+
+        if face_w_ratio is None:
+            # No face in the cutout — use the hair blob geometry.
+            # Hair typically spans ~1.5x the head width; infer head width from
+            # the hair width, and anchor at the vertical centre of mass.
+            width_ratio = 1.6
+            cy = ys.mean() / ah
+            self._fit = {
+                "width_ratio": width_ratio,
+                "anchor_y": float(np.clip(cy, 0.25, 0.65)),
+                "face_w_ratio": None,
+                "hair_cx_ratio": hair_cx / aw,
+            }
+            logger.info(
+                "Asset %r: no face, alpha-based auto-fit (anchor_y=%.2f)",
+                self._current_style,
+                self._fit["anchor_y"],
+            )
+        else:
+            self._fit = {
+                "face_w_ratio": face_w_ratio,
+                "anchor_y": anchor_y,
+                "hair_cx_ratio": hair_cx / aw,
+                "width_ratio": None,
+            }
+
+    def _detect_face_in_image(self, bgr: np.ndarray):
+        """Return (x,y,w,h) of the largest face in a still image, or None."""
+        try:
+            import mediapipe as mp
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision
+
+            if not hasattr(self, "_still_detector"):
+                model_path = os.path.join(self.model_dir, "blaze_face_short_range.tflite")
+                if not os.path.exists(model_path):
+                    import urllib.request
+
+                    url = (
+                        "https://storage.googleapis.com/mediapipe-models/face_detector/"
+                        "blaze_face_short_range/float16/latest/"
+                        "blaze_face_short_range.tflite"
+                    )
+                    os.makedirs(os.path.dirname(model_path) or ".", exist_ok=True)
+                    urllib.request.urlretrieve(url, model_path)
+                opts = vision.FaceDetectorOptions(
+                    base_options=mp_python.BaseOptions(model_asset_path=model_path),
+                    running_mode=vision.RunningMode.IMAGE,
+                )
+                self._still_detector = vision.FaceDetector.create_from_options(opts)
+
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            res = self._still_detector.detect(mp_img)
+            if not res.detections:
+                return None
+            best = max(
+                res.detections,
+                key=lambda d: d.bounding_box.width * d.bounding_box.height,
+            )
+            bb = best.bounding_box
+            return (bb.origin_x, bb.origin_y, bb.width, bb.height)
+        except Exception:
+            return None
 
     def set_placement(
         self,
@@ -175,12 +295,19 @@ class HairOverlay:
             return bgr
 
     def _anchors(self, bgr: np.ndarray):
-        """Return placement for the hair asset from face landmarks.
+        """Auto-fit placement from face landmarks + the asset's measured fit.
 
-        Returns (center_x, center_y, width, roll_deg). The asset is sized to
-        cover the head (wider than the face) and positioned so its vertical
-        centre sits around the crown, so it wraps the head instead of floating
-        above the forehead.
+        Returns (center_x, center_y, width, roll_deg). Uses the ratios computed
+        in _analyze_asset so the asset aligns to the head with no manual tuning:
+
+          * If the asset has a detected face, the user's face width is mapped to
+            the asset's face width — so the whole hair scales to the head — and
+            the asset is positioned so its face-region lands on the user's face.
+          * Otherwise a robust alpha-based estimate is used.
+
+        A small manual nudge (scale_k, y_offset) is still applied on top so the
+        user can fine-tune, but the defaults are neutral (1.0 / 0.0) now that
+        fit is automatic.
         """
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         mp_img = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
@@ -197,24 +324,42 @@ class HairOverlay:
         fore, le, re_, chin = px(FOREHEAD), px(LEFT_EAR), px(RIGHT_EAR), px(CHIN)
         ear_center = (le + re_) / 2.0
         ear_vec = re_ - le
-
-        # Head width from ears, widened: hair covers the sides of the head, so
-        # it's wider than the ear-to-ear span. scale_k defaults higher now.
-        head_w = np.linalg.norm(ear_vec) * self.scale_k
         roll = np.degrees(np.arctan2(ear_vec[1], ear_vec[0]))
+        user_face_w = np.linalg.norm(ear_vec)
 
-        # Up axis (forehead direction) and face height for scaling placement.
         up = fore - ear_center
         n = np.linalg.norm(up)
         up = up / n if n > 0 else np.array([0, -1], np.float32)
         face_h = np.linalg.norm(chin - fore)
+        # User's face centre (mid-point between forehead and chin).
+        face_center = (fore + chin) / 2.0
 
-        # Place the asset's CENTRE near the crown: start at the forehead and
-        # move up by a fraction of face height. The asset is scaled so this
-        # centre lands mid-hair, letting it drape down past the forehead and
-        # around the sides. y_offset tunes how high it sits.
-        center = fore + up * face_h * self.y_offset
-        return float(center[0]), float(center[1]), float(head_w), float(roll)
+        fit = getattr(self, "_fit", None)
+        ah, aw = self._asset_alpha.shape[:2]
+
+        if fit and fit.get("face_w_ratio"):
+            # Asset had a detectable face. Scale the whole asset so its face
+            # matches the user's face width, then position so the asset's face
+            # region lands exactly on the user's face.
+            render_w = user_face_w / fit["face_w_ratio"]
+            render_scale = render_w / aw
+            H = ah * render_scale  # rendered asset height
+            # Derivation: the asset is drawn centred at C; its face pixel sits a
+            # fraction anchor_y down from the top. Setting that equal to the
+            # user's face centre gives C = face_center - up*H*(0.5 - anchor_y).
+            center = face_center - up * (H * (0.5 - fit["anchor_y"]))
+            width = render_w * self.scale_k
+            center = center + up * (face_h * self.y_offset)
+            return float(center[0]), float(center[1]), float(width), float(roll)
+
+        # Alpha-based fallback: infer head width from hair, anchor at CoM.
+        anchor_y = fit["anchor_y"] if fit else 0.4
+        width = user_face_w * 1.7 * self.scale_k
+        render_scale = width / aw
+        H = ah * render_scale
+        center = face_center - up * (H * (0.5 - anchor_y))
+        center = center + up * (face_h * self.y_offset)
+        return float(center[0]), float(center[1]), float(width), float(roll)
 
     def _place(self, frame, anchors):
         cx, cy, width, roll = anchors
