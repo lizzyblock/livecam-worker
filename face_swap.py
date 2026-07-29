@@ -147,7 +147,12 @@ class FaceSwapEngine:
         # Detection is the expensive step and faces barely move between
         # frames, so it runs every Nth frame and the last known landmarks
         # are reused in between.
-        self.detect_every = max(1, int(os.environ.get("DETECT_EVERY", "3")))
+        self.detect_every = max(1, int(os.environ.get("DETECT_EVERY", "2")))
+        # Landmark smoothing factor (EMA). 0 = off (raw, jittery), 1 = frozen.
+        # ~0.5 removes most wobble while staying responsive to real movement.
+        self.smooth = float(os.environ.get("SMOOTH", "0.5"))
+        self._prev_kps = None
+        self._prev_bbox = None
         # How much bigger than the face box to composite over. Below ~1.6 the
         # blend can clip; above ~2.5 there's no benefit, just more pixels.
         self.crop_scale = float(os.environ.get("BLEND_CROP_SCALE", "2.0"))
@@ -622,6 +627,43 @@ class FaceSwapEngine:
         )
         return SwapSource(normed_embedding=face.normed_embedding, name=name)
 
+    def _smooth_targets(self, targets: list) -> list:
+        """Exponentially smooth the primary face's landmarks across frames.
+
+        Only the largest face is tracked (the streamer). Its keypoints and box
+        are blended toward the previous frame's, so detection noise and the
+        cache's periodic snap turn into smooth motion. A large jump — a real
+        fast turn, or a new person — resets the filter so it doesn't lag or
+        smear across the cut.
+        """
+        if not targets or self.smooth <= 0:
+            self._prev_kps = None
+            return targets
+
+        # Largest face = the streamer.
+        face = max(
+            targets,
+            key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
+        )
+        kps = face.kps.astype(np.float32)
+        bbox = face.bbox.astype(np.float32)
+
+        if self._prev_kps is not None and self._prev_kps.shape == kps.shape:
+            # Reset if the face moved a lot (fast turn / different person),
+            # measured relative to face size so it scales with distance.
+            face_w = max(1.0, bbox[2] - bbox[0])
+            jump = np.linalg.norm(kps - self._prev_kps, axis=1).mean() / face_w
+            if jump < 0.35:
+                a = self.smooth
+                kps = a * self._prev_kps + (1 - a) * kps
+                bbox = a * self._prev_bbox + (1 - a) * bbox
+
+        self._prev_kps = kps
+        self._prev_bbox = bbox
+        face.kps = kps
+        face.bbox = bbox
+        return [face]
+
     def swap_frame(self, frame_bgr: np.ndarray, source: SwapSource) -> np.ndarray:
         """Swap the streamer's face toward the source identity.
 
@@ -640,6 +682,15 @@ class FaceSwapEngine:
             self.t_detect += time.perf_counter() - t0
             self.n_detect += 1
             if targets:
+                # Temporal smoothing kills the frame-to-frame wobble.
+                #
+                # Detection carries small random noise, and the reuse-then-snap
+                # cache pattern makes the face jump every Nth frame. Blending
+                # each new detection toward the previous one with an
+                # exponential filter (EMA) makes the landmarks glide instead of
+                # snap — the single biggest fix for "juddery". SMOOTH=0
+                # disables; higher = steadier but laggier on fast turns.
+                targets = self._smooth_targets(targets)
                 self._cached_targets = targets
         else:
             targets = self._cached_targets
