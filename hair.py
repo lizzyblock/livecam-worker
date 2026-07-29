@@ -50,7 +50,14 @@ class HairOverlay:
 
     def __init__(self, model_dir: str, asset_dir: Optional[str] = None):
         self.model_dir = model_dir
-        self.asset_dir = asset_dir or os.path.join(model_dir, "hair_assets")
+        # Assets ship WITH the code (committed to the repo), so they live next
+        # to this file at <app>/hair_assets — not under /models, which is a
+        # mounted volume the repo doesn't populate.
+        if asset_dir:
+            self.asset_dir = asset_dir
+        else:
+            here = os.path.dirname(os.path.abspath(__file__))
+            self.asset_dir = os.path.join(here, "hair_assets")
         self.enabled = False
         self.seamless = os.environ.get("HAIR_SEAMLESS", "0") == "1"
         # Vertical placement nudge as a fraction of head height (assets sit a
@@ -69,18 +76,36 @@ class HairOverlay:
     def _init_mesh(self) -> None:
         try:
             import mediapipe as mp
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision
 
-            self._mesh = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=False,
-                max_num_faces=1,
-                refine_landmarks=False,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5,
+            model_path = os.path.join(self.model_dir, "face_landmarker.task")
+            if not os.path.exists(model_path):
+                self._fetch_landmarker(model_path)
+
+            opts = vision.FaceLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=model_path),
+                running_mode=vision.RunningMode.VIDEO,
+                num_faces=1,
             )
-            logger.info("Hair overlay: Face Mesh ready")
+            self._mesh = vision.FaceLandmarker.create_from_options(opts)
+            self._mp = mp
+            self._ts = 0
+            logger.info("Hair overlay: FaceLandmarker ready")
         except Exception as e:
             logger.error("Hair overlay unavailable (mediapipe: %s)", e)
             self._mesh = None
+
+    def _fetch_landmarker(self, dest: str) -> None:
+        import urllib.request
+
+        url = (
+            "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+            "face_landmarker/float16/latest/face_landmarker.task"
+        )
+        logger.info("Fetching face_landmarker model …")
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        urllib.request.urlretrieve(url, dest)
 
     def list_styles(self) -> list[str]:
         """Available hair asset names (PNG filenames without extension)."""
@@ -131,13 +156,15 @@ class HairOverlay:
             return bgr
 
     def _anchors(self, bgr: np.ndarray):
-        """Return (center_x, center_y, width, roll_deg) from the face mesh."""
+        """Return (center_x, center_y, width, roll_deg) from the landmarker."""
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        res = self._mesh.process(rgb)
-        if not res.multi_face_landmarks:
+        mp_img = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
+        self._ts += 33
+        res = self._mesh.detect_for_video(mp_img, self._ts)
+        if not res.face_landmarks:
             return None
         h, w = bgr.shape[:2]
-        lm = res.multi_face_landmarks[0].landmark
+        lm = res.face_landmarks[0]
 
         def px(i):
             return np.array([lm[i].x * w, lm[i].y * h], dtype=np.float32)
