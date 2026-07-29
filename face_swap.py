@@ -63,6 +63,9 @@ class SwapSource:
 
     normed_embedding: np.ndarray
     name: str
+    # Median Lab skin tone of the reference portrait, used to recolour the
+    # swapped face toward the uploaded image instead of the subject's skin.
+    skin_lab: Optional[np.ndarray] = None
 
 
 class FaceSwapEngine:
@@ -168,6 +171,18 @@ class FaceSwapEngine:
         # edges start to look electric.
         self.sharpen = float(os.environ.get("FACE_SHARPEN", "0.35"))
 
+        # Colour matching: push the swapped face toward the uploaded portrait's
+        # skin tone instead of the subject's. ON by default now — it's what
+        # "keep the target's colour" means. color_ab drives the hue match,
+        # color_l a gentler luminance nudge.
+        self.color_match = os.environ.get("COLOR_MATCH", "1") != "0"
+        self.color_ab = float(os.environ.get("COLOR_AB", "0.85"))
+        self.color_l = float(os.environ.get("COLOR_L", "0.5"))
+
+        # Skin smoothing strength on the swapped face (0 off, ~0.4 natural,
+        # >0.7 plasticky).
+        self.smooth_face = float(os.environ.get("SMOOTH_FACE", "0.4"))
+
         # Optional GFPGAN face restoration. The swap model emits a soft
         # 128x128 face; GFPGAN reconstructs realistic skin/eye/mouth detail,
         # the single biggest available quality jump. It costs ~15-30ms/frame,
@@ -204,6 +219,7 @@ class FaceSwapEngine:
         self._crop_logged = False
         self._crop_fallback_logged = False
         self._blend_logged = False
+        self.last_swapped_face = None
         self.t_detect = 0.0
         self.t_swap = 0.0
         self.n_detect = 0
@@ -315,6 +331,48 @@ class FaceSwapEngine:
         )
         k = (size // 8) * 2 + 1  # odd kernel, ~16px feather at 128
         return cv2.GaussianBlur(m, (k, k), 0)
+
+    def _finish_face(self, face: np.ndarray, source: "SwapSource") -> np.ndarray:
+        """Recolour the swapped face toward the portrait, then smooth skin.
+
+        inswapper blends the source identity with the *target* frame's colour,
+        so the swapped face tends to take on the subject's skin tone. When the
+        portrait's tone is known, this shifts the face's colour (a/b in Lab,
+        and part of L) toward it, so the result matches the uploaded image.
+        Smoothing is a light bilateral filter — evens skin while keeping edges.
+        """
+        out = face
+
+        # Colour transfer toward the portrait's tone.
+        if self.color_match and source is not None and source.skin_lab is not None:
+            lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB).astype(np.float32)
+            # Current tone of the swapped face centre.
+            h, w = lab.shape[:2]
+            centre = lab[int(h * 0.35) : int(h * 0.7), int(w * 0.25) : int(w * 0.75)]
+            cur = np.median(centre.reshape(-1, 3), axis=0)
+            tgt = source.skin_lab
+            shift = np.array(
+                [
+                    (tgt[0] - cur[0]) * self.color_l,  # luminance, partial
+                    (tgt[1] - cur[1]) * self.color_ab,  # a channel
+                    (tgt[2] - cur[2]) * self.color_ab,  # b channel
+                ],
+                dtype=np.float32,
+            )
+            lab += shift
+            out = cv2.cvtColor(
+                np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR
+            )
+
+        # Skin smoothing — bilateral keeps edges (eyes, lips) sharp while
+        # evening skin. Blended at `smooth_face` strength so it doesn't turn
+        # plasticky.
+        if self.smooth_face > 0:
+            sm = cv2.bilateralFilter(out, d=7, sigmaColor=45, sigmaSpace=45)
+            a = self.smooth_face
+            out = cv2.addWeighted(sm, a, out, 1 - a, 0)
+
+        return out
 
     def _fast_paste(self, frame: np.ndarray, face_128: np.ndarray, M: np.ndarray) -> np.ndarray:
         """Warp the swapped face back and composite it.
@@ -429,6 +487,13 @@ class FaceSwapEngine:
                 face_128, M = self.swapper.get(
                     frame, target, source, paste_back=False
                 )
+                # Expose the swapped face so the recolour stage can sample its
+                # skin tone for hand/neck matching.
+                self.last_swapped_face = face_128
+                # Recolour toward the uploaded portrait's skin tone (overrides
+                # inswapper's tendency to blend with the subject) and optionally
+                # smooth the skin. Both operate on the aligned 128px face.
+                face_128 = self._finish_face(face_128, source)
                 if not self._blend_logged:
                     self._blend_logged = True
                     logger.info(
@@ -625,7 +690,24 @@ class FaceSwapEngine:
             int(face.bbox[2] - face.bbox[0]),
             int(face.bbox[3] - face.bbox[1]),
         )
-        return SwapSource(normed_embedding=face.normed_embedding, name=name)
+        # Sample the portrait's skin tone from the face region, so the swap
+        # can be recoloured toward the *uploaded image* rather than inheriting
+        # the subject's skin. Median over the cheek/forehead band avoids eyes,
+        # brows and lips skewing it.
+        x1, y1, x2, y2 = [int(v) for v in face.bbox]
+        x1, y1 = max(0, x1), max(0, y1)
+        crop = portrait_bgr[y1:y2, x1:x2]
+        skin_lab = None
+        if crop.size:
+            ch, cw = crop.shape[:2]
+            band = crop[int(ch * 0.35) : int(ch * 0.7), int(cw * 0.25) : int(cw * 0.75)]
+            if band.size:
+                lab = cv2.cvtColor(band, cv2.COLOR_BGR2LAB).reshape(-1, 3)
+                skin_lab = np.median(lab, axis=0).astype(np.float32)
+
+        return SwapSource(
+            normed_embedding=face.normed_embedding, name=name, skin_lab=skin_lab
+        )
 
     def _smooth_targets(self, targets: list) -> list:
         """Exponentially smooth the primary face's landmarks across frames.

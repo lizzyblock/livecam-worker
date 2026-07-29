@@ -55,6 +55,7 @@ class SessionAgent:
         cfg: dict,
     ):
         self.engine = engine
+        self.recolor = None  # lazily created when a recolor stage is enabled
         self.styles = styles
         self.room_name = room_name
         self.cfg = cfg
@@ -204,6 +205,43 @@ class SessionAgent:
             asyncio.create_task(self._load_voice(msg.get("voice")))
         elif kind == "set_style":
             self._set_style(msg.get("preset"))
+        elif kind == "set_recolor":
+            self._set_recolor(msg)
+
+    def _ensure_recolor(self):
+        if self.recolor is None:
+            import recolor as _rc
+
+            self.recolor = _rc.Recolorizer(self.engine.model_dir)
+        return self.recolor
+
+    def _set_recolor(self, msg: dict) -> None:
+        """Toggle/adjust the recolour stages live.
+
+        {"type":"set_recolor","skin_match":true,
+         "shirt": "#3366cc" | null,          # null disables shirt tint
+         "background": "off"|"blur"|"replace"}
+        """
+        rc = self._ensure_recolor()
+        if "skin_match" in msg:
+            rc.skin_match = bool(msg["skin_match"])
+        if "shirt" in msg:
+            hexv = msg["shirt"]
+            if hexv:
+                h = hexv.lstrip("#")
+                r, g, b = (int(h[i : i + 2], 16) for i in (0, 2, 4))
+                rc.shirt_bgr = (b, g, r)
+                rc.shirt_on = True
+            else:
+                rc.shirt_on = False
+        if "background" in msg:
+            rc.bg_mode = msg["background"] or "off"
+        logger.info(
+            "Recolour: skin=%s shirt=%s bg=%s",
+            rc.skin_match,
+            rc.shirt_on,
+            rc.bg_mode,
+        )
 
     # -- media -----------------------------------------------------
 
@@ -382,6 +420,27 @@ class SessionAgent:
                 if self._style_errors == 1 or self._style_errors % 300 == 0:
                     logger.error(
                         "Look failing (%d frames): %s", self._style_errors, e
+                    )
+
+        # Region recolour (shirt / skin-match / background) runs last, after
+        # the face is swapped, so the skin-match stage can pull its target
+        # tone from the already-swapped face.
+        if self.recolor is not None and self.recolor.active:
+            try:
+                import time as _t
+
+                if self.recolor.skin_match:
+                    face_crop = getattr(self.engine, "last_swapped_face", None)
+                    if face_crop is not None:
+                        self.recolor.set_face_skin(face_crop)
+                bgr = self.recolor.apply(bgr, int(_t.monotonic() * 1000))
+            except Exception as e:
+                self._recolor_errors = getattr(self, "_recolor_errors", 0) + 1
+                if self._recolor_errors == 1 or self._recolor_errors % 300 == 0:
+                    logger.error(
+                        "Recolour failing (%d frames): %s",
+                        self._recolor_errors,
+                        e,
                     )
         return bgr
 
