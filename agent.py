@@ -10,6 +10,7 @@ transformed tracks:
 The streamer's browser and the desktop virtual-camera companion subscribe to
 those, and that is what reaches OBS/Zoom/Twitch.
 
+
 Everything is hot-swappable mid-session over LiveKit data messages, so
 changing a face, look or voice never drops the stream.
 """
