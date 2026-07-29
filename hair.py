@@ -60,10 +60,13 @@ class HairOverlay:
             self.asset_dir = os.path.join(here, "hair_assets")
         self.enabled = False
         self.seamless = os.environ.get("HAIR_SEAMLESS", "0") == "1"
-        # Vertical placement nudge as a fraction of head height (assets sit a
-        # little above the forehead landmark).
-        self.y_offset = float(os.environ.get("HAIR_Y_OFFSET", "0.35"))
-        self.scale_k = float(os.environ.get("HAIR_SCALE", "1.15"))
+        # Vertical placement of the asset centre, as a fraction of face height
+        # above the forehead. Higher = asset sits higher on the head. Negative
+        # pushes it down onto the face. Tune live with set_placement.
+        self.y_offset = float(os.environ.get("HAIR_Y_OFFSET", "0.15"))
+        # Width multiplier vs ear-to-ear span. Hair is wider than the face and
+        # wraps the sides of the head, so this is >1.
+        self.scale_k = float(os.environ.get("HAIR_SCALE", "1.7"))
 
         self._mesh = None
         self._asset_bgr: Optional[np.ndarray] = None
@@ -137,6 +140,22 @@ class HairOverlay:
         logger.info("Hair style set to %r (%dx%d)", name, img.shape[1], img.shape[0])
         return True
 
+    def set_placement(
+        self,
+        scale: Optional[float] = None,
+        y_offset: Optional[float] = None,
+    ) -> None:
+        """Adjust fit live, without a rebuild.
+
+        The right values depend on how the specific PNG was cropped (how much
+        scalp/forehead it includes), so this lets you dial it in on the fly.
+        """
+        if scale is not None:
+            self.scale_k = float(scale)
+        if y_offset is not None:
+            self.y_offset = float(y_offset)
+        logger.info("Hair placement: scale=%.2f y_offset=%.2f", self.scale_k, self.y_offset)
+
     @property
     def active(self) -> bool:
         return self.enabled and self._mesh is not None and self._asset_bgr is not None
@@ -156,7 +175,13 @@ class HairOverlay:
             return bgr
 
     def _anchors(self, bgr: np.ndarray):
-        """Return (center_x, center_y, width, roll_deg) from the landmarker."""
+        """Return placement for the hair asset from face landmarks.
+
+        Returns (center_x, center_y, width, roll_deg). The asset is sized to
+        cover the head (wider than the face) and positioned so its vertical
+        centre sits around the crown, so it wraps the head instead of floating
+        above the forehead.
+        """
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         mp_img = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
         self._ts += 33
@@ -170,16 +195,25 @@ class HairOverlay:
             return np.array([lm[i].x * w, lm[i].y * h], dtype=np.float32)
 
         fore, le, re_, chin = px(FOREHEAD), px(LEFT_EAR), px(RIGHT_EAR), px(CHIN)
+        ear_center = (le + re_) / 2.0
         ear_vec = re_ - le
+
+        # Head width from ears, widened: hair covers the sides of the head, so
+        # it's wider than the ear-to-ear span. scale_k defaults higher now.
         head_w = np.linalg.norm(ear_vec) * self.scale_k
         roll = np.degrees(np.arctan2(ear_vec[1], ear_vec[0]))
-        head_h = np.linalg.norm(chin - fore)
 
-        # Centre the asset above the forehead, along the head's up axis.
-        up = fore - (le + re_) / 2.0
+        # Up axis (forehead direction) and face height for scaling placement.
+        up = fore - ear_center
         n = np.linalg.norm(up)
         up = up / n if n > 0 else np.array([0, -1], np.float32)
-        center = fore + up * head_h * self.y_offset
+        face_h = np.linalg.norm(chin - fore)
+
+        # Place the asset's CENTRE near the crown: start at the forehead and
+        # move up by a fraction of face height. The asset is scaled so this
+        # centre lands mid-hair, letting it drape down past the forehead and
+        # around the sides. y_offset tunes how high it sits.
+        center = fore + up * face_h * self.y_offset
         return float(center[0]), float(center[1]), float(head_w), float(roll)
 
     def _place(self, frame, anchors):

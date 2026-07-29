@@ -10,7 +10,6 @@ transformed tracks:
 The streamer's browser and the desktop virtual-camera companion subscribe to
 those, and that is what reaches OBS/Zoom/Twitch.
 
-
 Everything is hot-swappable mid-session over LiveKit data messages, so
 changing a face, look or voice never drops the stream.
 """
@@ -211,6 +210,11 @@ class SessionAgent:
             self._set_recolor(msg)
         elif kind == "set_hairstyle":
             self._set_hairstyle(msg.get("style"))
+        elif kind == "set_hair_fit":
+            if self.hair is not None:
+                self.hair.set_placement(
+                    scale=msg.get("scale"), y_offset=msg.get("y_offset")
+                )
 
     def _set_hairstyle(self, style: Optional[str]) -> None:
         """Load a hairstyle PNG overlay (distinct from hair *colour*)."""
