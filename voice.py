@@ -42,7 +42,7 @@ SILENCE_RMS = 350
 # Cut a chunk after this much trailing silence (ms).
 SILENCE_HANG_MS = 260
 # Never let a chunk run longer than this, even mid-sentence (ms).
-MAX_CHUNK_MS = 2600
+MAX_CHUNK_MS = 4000
 # Don't bother converting anything shorter than this (ms).
 MIN_CHUNK_MS = 320
 
@@ -141,12 +141,37 @@ class VoiceConverter:
                 return None
             if len(data) % 2:
                 data = data[: len(data) - 1]
-            return np.frombuffer(data, dtype=np.int16)
+            pcm = np.frombuffer(data, dtype=np.int16)
+
+            # Fade the first and last few ms of every converted chunk.
+            #
+            # Chunks are concatenated for playback, and without a fade each
+            # boundary is a hard step in the waveform — that discontinuity is
+            # the click/screech heard every couple of seconds when a chunk is
+            # cut mid-phrase. A short raised-cosine ramp on each edge makes
+            # consecutive chunks blend smoothly. ~8ms is inaudible as a fade
+            # but long enough to kill the step.
+            return self._fade_edges(pcm)
         except Exception as e:
             logger.warning("STS error: %s", e)
             return None
         finally:
             self._inflight -= 1
+
+    def _fade_edges(self, pcm: np.ndarray, fade_ms: int = 8) -> np.ndarray:
+        """Apply a short raised-cosine fade to both ends of a chunk.
+
+        Removes the step discontinuity at chunk boundaries that plays as a
+        click. Returns int16.
+        """
+        n = int(self.sample_rate * fade_ms / 1000)
+        if len(pcm) < 2 * n or n < 1:
+            return pcm
+        f = pcm.astype(np.float32)
+        ramp = 0.5 * (1 - np.cos(np.linspace(0, np.pi, n, dtype=np.float32)))
+        f[:n] *= ramp
+        f[-n:] *= ramp[::-1]
+        return f.astype(np.int16)
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -169,20 +194,42 @@ class FrameQueue:
         self.frame_samples = frame_samples
         self._pending = np.zeros(0, dtype=np.int16)
         self._lock = asyncio.Lock()
+        self._was_dry = True
 
     async def push(self, pcm: np.ndarray) -> None:
         async with self._lock:
             self._pending = np.concatenate([self._pending, pcm])
 
     async def pop(self) -> np.ndarray:
-        """Returns one frame, padding with silence when the buffer is dry."""
+        """Returns one frame, ramping to/from silence when the buffer is dry.
+
+        A hard cut from audio to zero (buffer underrun mid-speech) is itself a
+        click. When the buffer can't fill a full frame, the tail of the real
+        audio is faded out rather than butted against silence, and the first
+        frame of returning audio is faded in.
+        """
         async with self._lock:
             if len(self._pending) >= self.frame_samples:
-                out = self._pending[: self.frame_samples]
+                out = self._pending[: self.frame_samples].copy()
                 self._pending = self._pending[self.frame_samples :]
+                # Fade in if we were previously dry (returning from silence).
+                if self._was_dry:
+                    self._was_dry = False
+                    r = min(64, len(out))
+                    ramp = np.linspace(0, 1, r, dtype=np.float32)
+                    out[:r] = (out[:r].astype(np.float32) * ramp).astype(np.int16)
                 return out
+
             out = np.zeros(self.frame_samples, dtype=np.int16)
             if len(self._pending):
-                out[: len(self._pending)] = self._pending
+                tail = self._pending
+                out[: len(tail)] = tail
+                # Fade the tail out into the silence padding.
+                r = min(64, len(tail))
+                ramp = np.linspace(1, 0, r, dtype=np.float32)
+                out[len(tail) - r : len(tail)] = (
+                    out[len(tail) - r : len(tail)].astype(np.float32) * ramp
+                ).astype(np.int16)
                 self._pending = np.zeros(0, dtype=np.int16)
+            self._was_dry = True
             return out
