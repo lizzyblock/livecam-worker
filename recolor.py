@@ -55,6 +55,13 @@ class Recolorizer:
         self.skin_match = os.environ.get("SKIN_MATCH", "0") == "1"
         self.shirt_on = os.environ.get("SHIRT_RECOLOR", "0") == "1"
         self.bg_mode = os.environ.get("BG_MODE", "off")  # off|blur|replace
+        # Hair recolour toward a target hair colour (from the portrait or a
+        # picker). Can't grow a new hairstyle, but colour is cheap and sells it.
+        self.hair_on = os.environ.get("HAIR_RECOLOR", "0") == "1"
+        self.hair_bgr: Optional[Tuple[int, int, int]] = None
+        # Lighting match: grade the whole person so the swapped face sits in
+        # the frame's real light rather than the portrait's studio light.
+        self.light_match = os.environ.get("LIGHT_MATCH", "0") == "1"
 
         # target shirt colour as BGR; None until set
         self.shirt_bgr: Optional[Tuple[int, int, int]] = None
@@ -114,7 +121,11 @@ class Recolorizer:
     def active(self) -> bool:
         """True if any stage is on AND the segmenter loaded."""
         return self._seg is not None and (
-            self.skin_match or self.shirt_on or self.bg_mode != "off"
+            self.skin_match
+            or self.shirt_on
+            or self.hair_on
+            or self.light_match
+            or self.bg_mode != "off"
         )
 
     # ---- per-frame -------------------------------------------------------
@@ -153,9 +164,15 @@ class Recolorizer:
         if self.shirt_on and self.shirt_bgr is not None:
             bgr = self._recolor_region(bgr, mask == CLOTHES, self.shirt_bgr)
 
+        if self.hair_on and self.hair_bgr is not None:
+            bgr = self._recolor_region(bgr, mask == HAIR, self.hair_bgr)
+
         if self.skin_match and self._face_skin_lab is not None:
             skin = (mask == BODY_SKIN)
             bgr = self._match_skin(bgr, skin, self._face_skin_lab)
+
+        if self.light_match:
+            bgr = self._match_lighting(bgr, mask)
 
         if self.bg_mode != "off":
             person = mask != BG
@@ -233,6 +250,42 @@ class Recolorizer:
         shifted = lab + shift
         out = lab * (1 - alpha) + shifted * alpha
         return cv2.cvtColor(np.clip(out, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+    def _match_lighting(self, bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Grade the swapped face into the frame's real light.
+
+        The principle from real body-swap systems: a face lifted from a studio
+        portrait carries that portrait's lighting, so it looks pasted into a
+        differently-lit room. This reads the brightness of the surrounding
+        real skin (neck/body) and nudges the face-skin brightness toward it,
+        so the face sits in the same light as the rest of the person. Only
+        luminance is touched — colour is left to the colour-match stages.
+        """
+        face_m = mask == FACE_SKIN
+        body_m = mask == BODY_SKIN
+        if not face_m.any() or not body_m.any():
+            return bgr
+
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        L = lab[:, :, 0]
+        face_L = float(np.median(L[face_m]))
+        body_L = float(np.median(L[body_m]))
+        if face_L <= 0:
+            return bgr
+
+        # Partial correction so the face keeps its own modelling; a full match
+        # flattens it. Scale factor toward the body's brightness.
+        target_L = face_L + (body_L - face_L) * 0.5
+        gain = np.clip(target_L / max(1.0, face_L), 0.7, 1.4)
+
+        alpha = self._feather(face_m, px=7)[:, :, 0]
+        L_new = L * (1 + (gain - 1) * alpha)
+        lab[:, :, 0] = np.clip(L_new, 0, 255)
+        return cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+    def set_hair_color(self, bgr: Optional[Tuple[int, int, int]]) -> None:
+        self.hair_bgr = bgr
+        self.hair_on = bgr is not None
 
     def set_background(self, img_bgr: Optional[np.ndarray]) -> None:
         self._bg_img = img_bgr

@@ -56,6 +56,7 @@ class SessionAgent:
     ):
         self.engine = engine
         self.recolor = None  # lazily created when a recolor stage is enabled
+        self.hair = None  # lazily created hairstyle overlay
         self.styles = styles
         self.room_name = room_name
         self.cfg = cfg
@@ -207,6 +208,17 @@ class SessionAgent:
             self._set_style(msg.get("preset"))
         elif kind == "set_recolor":
             self._set_recolor(msg)
+        elif kind == "set_hairstyle":
+            self._set_hairstyle(msg.get("style"))
+
+    def _set_hairstyle(self, style: Optional[str]) -> None:
+        """Load a hairstyle PNG overlay (distinct from hair *colour*)."""
+        if self.hair is None:
+            import hair as _hair
+
+            self.hair = _hair.HairOverlay(self.engine.model_dir)
+        ok = self.hair.set_style(style)
+        logger.info("Hairstyle set to %r (ok=%s)", style, ok)
 
     def _ensure_recolor(self):
         if self.recolor is None:
@@ -236,10 +248,22 @@ class SessionAgent:
                 rc.shirt_on = False
         if "background" in msg:
             rc.bg_mode = msg["background"] or "off"
+        if "hair" in msg:
+            hexv = msg["hair"]
+            if hexv:
+                h = hexv.lstrip("#")
+                r, g, b = (int(h[i : i + 2], 16) for i in (0, 2, 4))
+                rc.set_hair_color((b, g, r))
+            else:
+                rc.set_hair_color(None)
+        if "light_match" in msg:
+            rc.light_match = bool(msg["light_match"])
         logger.info(
-            "Recolour: skin=%s shirt=%s bg=%s",
+            "Recolour: skin=%s shirt=%s hair=%s light=%s bg=%s",
             rc.skin_match,
             rc.shirt_on,
+            rc.hair_on,
+            rc.light_match,
             rc.bg_mode,
         )
 
@@ -442,6 +466,16 @@ class SessionAgent:
                         self._recolor_errors,
                         e,
                     )
+
+        # Hairstyle overlay (pre-made PNG anchored to the face mesh).
+        if self.hair is not None and self.hair.active:
+            try:
+                bgr = self.hair.apply(bgr)
+            except Exception as e:
+                self._hair_errors = getattr(self, "_hair_errors", 0) + 1
+                if self._hair_errors == 1 or self._hair_errors % 300 == 0:
+                    logger.error("Hair overlay failing (%d frames): %s",
+                                 self._hair_errors, e)
         return bgr
 
     async def _process_audio(self, stream: rtc.AudioStream) -> None:
