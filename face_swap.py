@@ -220,6 +220,8 @@ class FaceSwapEngine:
         self._crop_fallback_logged = False
         self._blend_logged = False
         self.last_swapped_face = None
+        self.last_kps = None
+        self.last_bbox = None
         self.t_detect = 0.0
         self.t_swap = 0.0
         self.n_detect = 0
@@ -490,6 +492,11 @@ class FaceSwapEngine:
                 # Expose the swapped face so the recolour stage can sample its
                 # skin tone for hand/neck matching.
                 self.last_swapped_face = face_128
+                # Expose this frame's face geometry so the hair overlay can
+                # reuse it instead of running a second face model (which caused
+                # both lag and disagreeing anchor points).
+                self.last_kps = target.kps.copy()
+                self.last_bbox = target.bbox.copy()
                 # Recolour toward the uploaded portrait's skin tone (overrides
                 # inswapper's tendency to blend with the subject) and optionally
                 # smooth the skin. Both operate on the aligned 128px face.

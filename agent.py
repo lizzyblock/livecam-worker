@@ -60,6 +60,11 @@ class SessionAgent:
         self.styles = styles
         self.room_name = room_name
         self.cfg = cfg
+        # Audio-only mode: skip the entire video pipeline and only run the
+        # mic → ElevenLabs → published-audio path. Used by the Avatar tab,
+        # whose video comes from Decart, not this worker — it wants just the
+        # cloned voice.
+        self.audio_only = bool(cfg.get("audioOnly"))
 
         self.source: Optional[SwapSource] = None
         self.style_fn = styles.get(cfg.get("effectPreset"))
@@ -90,7 +95,8 @@ class SessionAgent:
     # -- lifecycle -------------------------------------------------
 
     async def start(self, token: str) -> None:
-        await self._load_face(self.cfg.get("face"))
+        if not self.audio_only:
+            await self._load_face(self.cfg.get("face"))
         await self._load_voice(self.cfg.get("voice"))
 
         self.room.on("track_subscribed", self._on_track)
@@ -114,14 +120,16 @@ class SessionAgent:
         # to match: a VideoSource declared at one size receiving frames at
         # another is interpreted with the wrong stride, which renders as
         # rainbow smearing rather than an error.
-        self._video_out = rtc.VideoSource(self._out_w, self._out_h)
-        video_track = rtc.LocalVideoTrack.create_video_track(
-            PROCESSED_VIDEO, self._video_out
-        )
-        await self.room.local_participant.publish_track(
-            video_track,
-            rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA),
-        )
+        # Video output — skipped entirely in audio-only mode.
+        if not self.audio_only:
+            self._video_out = rtc.VideoSource(self._out_w, self._out_h)
+            video_track = rtc.LocalVideoTrack.create_video_track(
+                PROCESSED_VIDEO, self._video_out
+            )
+            await self.room.local_participant.publish_track(
+                video_track,
+                rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA),
+            )
 
         self._audio_out = rtc.AudioSource(AUDIO_SAMPLE_RATE, 1)
         audio_track = rtc.LocalAudioTrack.create_audio_track(
@@ -289,6 +297,10 @@ class SessionAgent:
         # Never consume our own output.
         if publication.name in (PROCESSED_VIDEO, PROCESSED_AUDIO):
             logger.debug("Ignoring our own %s", publication.name)
+            return
+        # In audio-only mode we don't touch video at all.
+        if self.audio_only and track.kind == rtc.TrackKind.KIND_VIDEO:
+            logger.debug("Audio-only session: ignoring incoming video")
             return
         if track.kind == rtc.TrackKind.KIND_VIDEO:
             # Belt and braces on resolution. The publisher disables simulcast
@@ -475,7 +487,11 @@ class SessionAgent:
         # Hairstyle overlay (pre-made PNG anchored to the face mesh).
         if self.hair is not None and self.hair.active:
             try:
-                bgr = self.hair.apply(bgr)
+                bgr = self.hair.apply(
+                    bgr,
+                    kps=getattr(self.engine, "last_kps", None),
+                    bbox=getattr(self.engine, "last_bbox", None),
+                )
             except Exception as e:
                 self._hair_errors = getattr(self, "_hair_errors", 0) + 1
                 if self._hair_errors == 1 or self._hair_errors % 300 == 0:

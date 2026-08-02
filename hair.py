@@ -77,27 +77,18 @@ class HairOverlay:
     # ---- setup -----------------------------------------------------------
 
     def _init_mesh(self) -> None:
+        # No per-frame face model here anymore. The hair overlay reuses the
+        # landmarks the face-swap engine already computes each frame, passed
+        # into apply(). This removed both the lag (two trackers per frame) and
+        # the anchor disagreement. The still-image FaceDetector used at asset
+        # load time (_detect_face_in_image) is separate and only runs once.
+        self._mesh = None
         try:
             import mediapipe as mp
-            from mediapipe.tasks import python as mp_python
-            from mediapipe.tasks.python import vision
 
-            model_path = os.path.join(self.model_dir, "face_landmarker.task")
-            if not os.path.exists(model_path):
-                self._fetch_landmarker(model_path)
-
-            opts = vision.FaceLandmarkerOptions(
-                base_options=mp_python.BaseOptions(model_asset_path=model_path),
-                running_mode=vision.RunningMode.VIDEO,
-                num_faces=1,
-            )
-            self._mesh = vision.FaceLandmarker.create_from_options(opts)
             self._mp = mp
-            self._ts = 0
-            logger.info("Hair overlay: FaceLandmarker ready")
-        except Exception as e:
-            logger.error("Hair overlay unavailable (mediapipe: %s)", e)
-            self._mesh = None
+        except Exception:
+            self._mp = None
 
     def _fetch_landmarker(self, dest: str) -> None:
         import urllib.request
@@ -290,21 +281,31 @@ class HairOverlay:
 
     @property
     def active(self) -> bool:
-        return self.enabled and self._mesh is not None and self._asset_bgr is not None
+        return self.enabled and self._asset_bgr is not None
 
     # ---- per-frame -------------------------------------------------------
 
-    def apply(self, bgr: np.ndarray) -> np.ndarray:
-        if not self.active:
+    def apply(self, bgr: np.ndarray, kps=None, bbox=None) -> np.ndarray:
+        """Composite the hair, anchored from face landmarks passed in.
+
+        `kps` is the 5-point InsightFace layout the swap engine already
+        computes each frame: [left_eye, right_eye, nose, left_mouth,
+        right_mouth]. Reusing it means no second face model runs — that was the
+        source of the lag — and the hair anchors to the exact same face the
+        swap uses.
+        """
+        if not self.enabled or self._asset_bgr is None:
             return bgr
+        if kps is None:
+            return bgr  # nothing to anchor to this frame
         try:
-            anchors = self._anchors(bgr)
+            anchors = self._anchors_from_kps(np.asarray(kps, dtype=np.float32), bbox)
             if anchors is None:
                 return bgr
             out = self._place(bgr, anchors)
             if self.debug:
                 cx, cy, width, roll = anchors
-                cv2.circle(out, (int(cx), int(cy)), 6, (0, 0, 255), -1)  # asset center = red
+                cv2.circle(out, (int(cx), int(cy)), 6, (0, 0, 255), -1)
                 cv2.putText(out, f"w={int(width)} roll={roll:.0f}",
                             (int(cx) - 60, int(cy) - 12),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
@@ -312,6 +313,58 @@ class HairOverlay:
         except Exception as e:
             logger.debug("hair apply error: %s", e)
             return bgr
+
+    def _anchors_from_kps(self, kps: np.ndarray, bbox):
+        """Compute (cx, cy, width, roll) from 5-point landmarks.
+
+        Layout: 0=left eye, 1=right eye, 2=nose, 3=left mouth, 4=right mouth.
+        """
+        if kps.shape[0] < 5:
+            return None
+        left_eye, right_eye = kps[0], kps[1]
+        nose = kps[2]
+        mouth = (kps[3] + kps[4]) / 2.0
+
+        eye_center = (left_eye + right_eye) / 2.0
+        eye_vec = right_eye - left_eye
+        eye_dist = np.linalg.norm(eye_vec)
+        roll = np.degrees(np.arctan2(eye_vec[1], eye_vec[0]))
+
+        # Head up-axis: from mouth up through eye centre (stable, roll-aware).
+        up = eye_center - mouth
+        n = np.linalg.norm(up)
+        up = up / n if n > 0 else np.array([0, -1], np.float32)
+
+        # Scale reference: interocular distance is ~0.46 of face width. Head
+        # (hair) width is ~2.1x eye distance. Vertical spans use eye distance
+        # too, so everything tracks with head size/distance.
+        head_w = eye_dist * 2.1 * self.scale_k
+
+        # The forehead sits about 0.6*eye_dist above the eye centre along up.
+        forehead = eye_center + up * (eye_dist * 0.6)
+
+        hb = getattr(self, "_hair_bounds", None)
+        ah, aw = self._asset_alpha.shape[:2]
+        if hb is None:
+            hb = {"top": 0, "bottom": ah, "w": aw, "cx": aw / 2.0}
+
+        # Scale asset so its hair width matches head width.
+        render_scale = head_w / max(1, hb["w"])
+        H = ah * render_scale
+        W = aw * render_scale
+
+        # Land the hair's bottom (hairline row hb['bottom']) at the forehead,
+        # with a small overlap; volume rises up over the scalp.
+        overlap = eye_dist * (0.5 - self.y_offset)
+        hair_bottom_from_top = hb["bottom"] * render_scale
+        top_point = forehead + up * (hair_bottom_from_top - overlap)
+        center = top_point - up * (H / 2.0)
+
+        # Horizontal: align the hair's own centre column to the eye centre x.
+        hair_cx_off = (hb["cx"] - aw / 2.0) * render_scale
+        center = center - np.array([hair_cx_off, 0.0], dtype=np.float32)
+
+        return float(center[0]), float(center[1]), float(W), float(roll)
 
     def _anchors(self, bgr: np.ndarray):
         """Auto-fit placement from face landmarks + the asset's measured fit.
